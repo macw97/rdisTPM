@@ -16,8 +16,15 @@ mod vmlinux;
 use aya_ebpf::{macros::lsm, programs::LsmContext};
 use aya_log_ebpf::info;
 use aya_ebpf::helpers;
+use aya_ebpf::maps::PerfEventArray;
 use core::str;
+use aya_ebpf::macros::map;
 use vmlinux::linux_binprm;
+use lsm_tpm_common::SecurityEvent;
+
+
+#[map(name="EVENTS")]
+static EVENTS: PerfEventArray<SecurityEvent> = PerfEventArray::new(0);
 
 #[lsm(hook = "bprm_check_security")]
 pub fn bprm_check_security(ctx: LsmContext) -> i32 {
@@ -47,8 +54,17 @@ unsafe fn try_bprm_check_security(ctx: LsmContext) -> Result<i32, i32> {
             info!(&ctx, "real_cred is null");
         } else {
             let uid = unsafe { (*creds).uid.val };
-            info!(&ctx, "filename: {} uid: {}", filename, uid);
+            let uns = bprm.unsafe_;
+            info!(&ctx, "filename: {} uid: {} unsafe: {}", filename, uid, uns);
         }
+        let event = SecurityEvent {
+            _filename: filename.as_bytes().try_into().unwrap_or([0u8; 32]),
+            _uid: unsafe { (*creds).uid.val },
+            _unsafe: bprm.unsafe_, 
+        }; 
+        
+        EVENTS.output(&ctx, &event, 0);
+        
     }
 
     Ok(0)

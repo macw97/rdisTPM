@@ -2,6 +2,67 @@ use aya::{Btf, programs::Lsm};
 #[rustfmt::skip]
 use log::{debug, warn};
 use tokio::signal;
+use aya::maps::{perf, MapData};
+use aya::util::online_cpus;
+use bytes::BytesMut;
+use lsm_tpm_common::SecurityEvent;
+use libc::{epoll_create1, epoll_ctl, epoll_wait, EPOLL_CTL_ADD, epoll_event, EPOLLIN};
+use std::os::fd::AsRawFd;
+use std::io;
+
+pub struct Epoll {
+    epfd: i32,
+    num_buffers: usize,
+}
+
+fn poll_buffers(perf_buffers: &Vec<perf::PerfEventArrayBuffer<&mut MapData>>) -> io::Result<Epoll> {
+    let epollfd = unsafe { epoll_create1(0) };
+    
+    if epollfd < 0 {
+        println!("Something wrong with epoll!");
+        return Err(io::Error::last_os_error());
+    }
+    println!("Created epoll instance with fd: {epollfd}");
+
+    for (i, perf_buffer) in perf_buffers.iter().enumerate() {
+        let fd = perf_buffer.as_raw_fd();
+        println!("Registering perf buffer {i} with fd: {fd} to epoll");
+
+        let mut event = epoll_event {
+            events: EPOLLIN as u32,
+            u64: i as u64, // Use the index as the user data
+        };
+
+        let res = unsafe { epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &mut event) };
+        if res < 0 {
+            println!("Failed to add fd {fd} to epoll: {res}");
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(Epoll { 
+        epfd: epollfd, 
+        num_buffers: perf_buffers.len(),
+    })
+}
+
+impl Epoll {
+    pub fn poll_readable(&self) -> io::Result<Vec<usize>> {
+        let mut events = vec![epoll_event { events: 0, u64: 0 }; self.num_buffers];
+        let nfds = unsafe { epoll_wait(self.epfd, events.as_mut_ptr(), events.len() as i32, -1) };
+        
+        if nfds < 0 {
+            println!("Error during epoll_wait: {nfds}");
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut ready_indices = Vec::new();
+        for i in 0..nfds as usize {
+            let idx = events[i].u64 as usize;
+            ready_indices.push(idx);
+        }
+        Ok(ready_indices)
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -48,10 +109,44 @@ async fn main() -> anyhow::Result<()> {
     program.load("bprm_check_security", &btf)?;
     program.attach()?;
 
-    let ctrl_c = signal::ctrl_c();
-    println!("Waiting for Ctrl-C...");
-    ctrl_c.await?;
-    println!("Exiting...");
+    let mut perf_array = aya::maps::perf::PerfEventArray::try_from(ebpf.map_mut("EVENTS").unwrap())?;
+    let mut perf_buffers = Vec::new();
+    for cpu_id in online_cpus().map_err(|(_, error)| error)? {
+        perf_buffers.push(perf_array.open(cpu_id, None)?);
+    }
+
+    let mut out_bufs = [bytes::BytesMut::with_capacity(1024)];
+    let pollfd = poll_buffers(&perf_buffers)?;
+
+    loop {
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                println!("Received Ctrl-C, exiting...");
+                break;
+            }
+
+            result = async { pollfd.poll_readable() } => {
+                match result {
+                    Ok(indices) => {
+                        for idx in indices {
+                            if idx < perf_buffers.len() {
+                                match perf_buffers[idx].read_events(&mut out_bufs) {
+                                    Ok(_events) => {
+                                        let event: SecurityEvent = unsafe {
+                                            std::ptr::read_unaligned(out_bufs[0].as_ptr() as *const SecurityEvent)
+                                        };
+                                        println!("Received event: {:?} , {:?}, {:?}", event._filename, event._uid, event._unsafe);
+                                    }
+                                    Err(e) => eprintln!("Failed to read events: {e}"),
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("Poll error: {e}"),
+                }
+            }
+        }
+    }
 
     Ok(())
 }
