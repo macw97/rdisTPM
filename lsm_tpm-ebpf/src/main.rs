@@ -57,8 +57,14 @@ unsafe fn try_bprm_check_security(ctx: LsmContext) -> Result<i32, i32> {
             let uns = bprm.unsafe_;
             info!(&ctx, "filename: {} uid: {} unsafe: {}", filename, uid, uns);
         }
+        
+        // Copy the actual bytes from buf into the event
+        let mut filename_bytes = [0u8; 32];
+        let copy_len = str_bytes.len().min(32);
+        filename_bytes[..copy_len].copy_from_slice(&str_bytes[..copy_len]);
+        
         let event = SecurityEvent {
-            _filename: filename.as_bytes().try_into().unwrap_or([0u8; 32]),
+            _filename: filename_bytes,
             _uid: unsafe { (*creds).uid.val },
             _unsafe: bprm.unsafe_, 
         }; 

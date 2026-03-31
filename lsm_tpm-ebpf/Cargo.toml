@@ -15,3 +15,6 @@ which = { workspace = true }
 [[bin]]
 name = "lsm_tpm"
 path = "src/main.rs"
+
+[profile.release]
+panic = "abort"

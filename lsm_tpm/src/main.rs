@@ -47,20 +47,36 @@ fn poll_buffers(perf_buffers: &Vec<perf::PerfEventArrayBuffer<&mut MapData>>) ->
 
 impl Epoll {
     pub fn poll_readable(&self) -> io::Result<Vec<usize>> {
-        let mut events = vec![epoll_event { events: 0, u64: 0 }; self.num_buffers];
-        let nfds = unsafe { epoll_wait(self.epfd, events.as_mut_ptr(), events.len() as i32, -1) };
-        
-        if nfds < 0 {
-            println!("Error during epoll_wait: {nfds}");
-            return Err(io::Error::last_os_error());
-        }
+        loop {
+            let mut events = vec![epoll_event { events: 0, u64: 0 }; self.num_buffers];
+            let nfds = unsafe { epoll_wait(self.epfd, events.as_mut_ptr(), events.len() as i32, -1) };
+            
+            if nfds < 0 {
+                let err = io::Error::last_os_error();
+                // Retry on EINTR (interrupted system call)
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                println!("Error during epoll_wait: {nfds}");
+                return Err(err);
+            }
 
-        let mut ready_indices = Vec::new();
-        for i in 0..nfds as usize {
-            let idx = events[i].u64 as usize;
-            ready_indices.push(idx);
+            let mut ready_indices = Vec::new();
+            for i in 0..nfds as usize {
+                let idx = events[i].u64 as usize;
+                ready_indices.push(idx);
+            }
+            return Ok(ready_indices);
         }
-        Ok(ready_indices)
+    }
+}
+
+impl Drop for Epoll {
+    fn drop(&mut self) {
+        if self.epfd >= 0 {
+            unsafe { libc::close(self.epfd) };
+            println!("Closed epoll fd: {}", self.epfd);
+        }
     }
 }
 
@@ -95,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(logger) => {
             let mut logger =
                 tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
-            tokio::task::spawn(async move {
+            let _logger_task = tokio::task::spawn(async move {
                 loop {
                     let mut guard = logger.readable_mut().await.unwrap();
                     guard.get_inner_mut().flush();
@@ -135,7 +151,12 @@ async fn main() -> anyhow::Result<()> {
                                         let event: SecurityEvent = unsafe {
                                             std::ptr::read_unaligned(out_bufs[0].as_ptr() as *const SecurityEvent)
                                         };
-                                        println!("Received event: {:?} , {:?}, {:?}", event._filename, event._uid, event._unsafe);
+                                        
+                                        // Convert filename byte array to C string (up to null terminator)
+                                        let filename_end = event._filename.iter().position(|&b| b == 0).unwrap_or(32);
+                                        let filename = String::from_utf8_lossy(&event._filename[..filename_end]);
+                                        
+                                        println!("Received event: filename={}, uid={}, unsafe={}", filename, event._uid, event._unsafe);
                                     }
                                     Err(e) => eprintln!("Failed to read events: {e}"),
                                 }
@@ -148,5 +169,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    println!("Exiting...");
     Ok(())
 }
