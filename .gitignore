@@ -22,3 +22,9 @@ target
 
 # Generated linux header file.
 vmlinux.rs
+
+# TPM context files and keys
+*.ctx
+*.pub
+*.priv
+*.key
