@@ -28,3 +28,5 @@ vmlinux.rs
 *.pub
 *.priv
 *.key
+*.so
+*.o
