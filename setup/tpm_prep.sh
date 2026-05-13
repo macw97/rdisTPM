@@ -7,8 +7,9 @@ SEALED_PUB="unlock.pub"
 SEALED_PRIV="unlock.priv"
 SEALED_CTX="unlock.ctx"
 VERIFY_KEY="verify.key"
+PRIMARY_HANDLE="0x81000001"
+SEALED_HANDLE="0x81000002"
 # ------------------
-
 
 echo "======= [1] Primary context check ======="
 
@@ -48,6 +49,47 @@ if [[ ! -f $SEALED_PUB && ! -f $SEALED_PRIV && -n "$PASSWORD"  ]]; then
     fi
 else
     echo "[+] Secret key already sealed."
+fi
+
+echo "======= [3.5] Make objects persistent in TPM ======="
+echo "[*] Ensuring $PRIMARY_HANDLE is free before making persistent..."
+if tpm2_getcap handles-persistent | grep -qi "$PRIMARY_HANDLE"; then
+    echo "[*] $PRIMARY_HANDLE already occupied, evicting first..."
+    if ! tpm2_evictcontrol -C o -c $PRIMARY_HANDLE; then
+        echo "[-] Failed to evict existing object at $PRIMARY_HANDLE" >&2
+        exit 1
+    fi
+fi
+
+if tpm2_evictcontrol -C o -c $PRIMARY_CTX $PRIMARY_HANDLE; then
+    echo "[+] Primary context saved to persistent handle $PRIMARY_HANDLE"
+else
+    echo "[-] Failed to save primary context" >&2
+    exit 1
+fi
+
+# Reload sealed object using the now-persistent primary
+if tpm2_load -C $PRIMARY_HANDLE -u $SEALED_PUB -r $SEALED_PRIV -c $SEALED_CTX; then
+    echo "[+] Sealed object reloaded with persistent primary"
+else
+    echo "[-] Failed to reload sealed object" >&2
+    exit 1
+fi
+
+echo "[*] Ensuring $SEALED_HANDLE is free before making persistent..."
+if tpm2_getcap handles-persistent | grep -qi "$SEALED_HANDLE"; then
+    echo "[*] $SEALED_HANDLE already occupied, evicting first..."
+    if ! tpm2_evictcontrol -C o -c $SEALED_HANDLE; then
+        echo "[-] Failed to evict existing object at $SEALED_HANDLE" >&2
+        exit 1
+    fi
+fi
+
+if tpm2_evictcontrol -C o -c $SEALED_CTX $SEALED_HANDLE; then
+    echo "[+] Sealed object saved to persistent handle $SEALED_HANDLE"
+else
+    echo "[-] Failed to save sealed object" >&2
+    exit 1
 fi
 
 echo "======= [4] Verify key sealing ======="
