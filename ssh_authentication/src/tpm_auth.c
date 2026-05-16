@@ -36,7 +36,7 @@ int read_password_credentials(char *buffer_pass, size_t pass_size, char *buffer_
         return -1;
     }
 
-    printf("Enter TPM password: ");
+    printf("\nEnter TPM password: ");
     fflush(stdout);
     if(fgets(buffer_pass, pass_size, stdin) == NULL) {
         tcsetattr(STDIN_FILENO, TCSANOW, &old);
