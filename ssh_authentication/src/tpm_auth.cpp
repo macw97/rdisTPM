@@ -1,56 +1,61 @@
-#include <stdio.h>
-#include <syslog.h>
-#include <stdlib.h>
-#include <string.h>
-#include <termios.h>
-#include <unistd.h>
-#include <tss2/tss2_esys.h>
-#include <tss2/tss2_tcti_device.h>
-#include <tss2/tss2_tctildr.h>
-#include <tss2/tss2_mu.h>
+#include <iostream>
+#include <cstring>
 
-TSS2_TCTI_CONTEXT *tcti_ctx = NULL;
-ESYS_CONTEXT *ctx = NULL;
-ESYS_TR object = ESYS_TR_NONE;
-TPM2B_SENSITIVE_DATA *out = NULL;
-TSS2_RC rc;
+extern "C" {
+    #include <syslog.h>
+    #include <termios.h>
+    #include <unistd.h>
+    #include <stdlib.h>
+    #include <tss2/tss2_esys.h>
+    #include <tss2/tss2_tcti_device.h>
+    #include <tss2/tss2_tctildr.h>
+    #include <tss2/tss2_mu.h>
+}
+
+extern "C" {
+    TSS2_TCTI_CONTEXT *tcti_ctx = NULL;
+    ESYS_CONTEXT *ctx = NULL;
+    ESYS_TR object = ESYS_TR_NONE;
+    TPM2B_SENSITIVE_DATA *out = NULL;
+    TSS2_RC rc;
+}
 
 int read_password_credentials(char *buffer_pass, size_t pass_size, char *buffer_user, size_t user_size) {
-    struct termios old, new;
+    struct termios _old, _new;
 
-    if(tcgetattr(STDIN_FILENO, &old) != 0) {
+    if(tcgetattr(STDIN_FILENO, &_old) != 0) {
         return -1;
     }
 
-    new = old;
-    new.c_lflag &= ~ECHO;
+    _new = _old;
+    _new.c_lflag &= ~ECHO;
 
-    if(tcsetattr(STDIN_FILENO, TCSANOW, &new) != 0) {
+    if(tcsetattr(STDIN_FILENO, TCSANOW, &_new) != 0) {
         return -1;
     }
 
     printf("Enter TPM username: ");
     fflush(stdout);
     if(fgets(buffer_user, user_size, stdin) == NULL) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &old);
+        tcsetattr(STDIN_FILENO, TCSANOW, &_old);
         return -1;
     }
 
     printf("\nEnter TPM password: ");
     fflush(stdout);
     if(fgets(buffer_pass, pass_size, stdin) == NULL) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &old);
+        tcsetattr(STDIN_FILENO, TCSANOW, &_old);
         return -1;
     }
 
-    tcsetattr(STDIN_FILENO, TCSANOW, &old);
+    tcsetattr(STDIN_FILENO, TCSANOW, &_old);
     buffer_user[strcspn(buffer_user, "\n")] = 0; // Remove newline character
     buffer_pass[strcspn(buffer_pass, "\n")] = 0; // Remove newline character
     return 0;
 }
 
 void secure_wipeout(void *v, size_t n) {
-    volatile unsigned char *p = v;
+    volatile unsigned char *p = static_cast<volatile unsigned char *>(v);
     while (n--) {
         *p++ = 0;
     }
@@ -73,7 +78,7 @@ TSS2_RC load_sealed_object_from_tpm(ESYS_CONTEXT *ctx, ESYS_TR *sealed_handle) {
     return TSS2_RC_SUCCESS;
 }
 
-int main(int argc, char **argv)
+int main()
 {
     ESYS_TR primary_handle = ESYS_TR_NONE;
     size_t primary_handle_size;
@@ -134,6 +139,7 @@ int main(int argc, char **argv)
     }
 
     secure_wipeout(username, sizeof(username));
+    secure_wipeout(password, sizeof(password));
 
 
     return 0; // Return 0 for successful authentication, 1 for failure
