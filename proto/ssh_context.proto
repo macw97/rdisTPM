@@ -1,0 +1,30 @@
+syntax = "proto3";
+package sshinfo;
+
+enum AuthenticationType {
+        NOT_AUTHENTICATED = 0;
+        NOT_TPM_AUTHENTICATED = 1;
+        OWNER_AUTHENTICATED = 2;
+}
+
+message SSHContext {
+    uint32 pid = 1;
+    bool tty = 2;
+    AuthenticationType auth = 3;
+}
+
+enum ErrorCode {
+    E_OK = 0;
+    E_GENERAL_ERROR = 1;
+    E_PID_NOT_WHITELISTED = 2;
+    E_INTERNAL_ERROR = 3;
+}
+
+message SSHResponse {
+    bool successful = 1;
+    optional ErrorCode error_code = 2;
+}
+
+service SSH {
+    rpc ContextSend(SSHContext) returns (SSHResponse);
+}

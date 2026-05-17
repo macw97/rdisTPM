@@ -23,10 +23,14 @@ tokio = { workspace = true, features = [
 ] }
 bytes = "1.11.1"
 nix = "0.31.2"
+tonic = "0.12.0"
+prost = "0.13.0"
+
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
 cargo_metadata = { workspace = true }
+tonic-build = "0.12.0"
 # TODO(https://github.com/rust-lang/cargo/issues/12375): this should be an artifact dependency, but
 # it's not possible to tell cargo to use `-Z build-std` to build it. We cargo-in-cargo in the build
 # script to build this, but we want to teach cargo about the dependency so that cache invalidation

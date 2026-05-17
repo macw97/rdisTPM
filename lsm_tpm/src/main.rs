@@ -10,6 +10,31 @@ use libc::{epoll_create1, epoll_ctl, epoll_wait, EPOLL_CTL_ADD, epoll_event, EPO
 use std::os::fd::AsRawFd;
 use std::io;
 
+use tonic::{transport::Server, Request, Response, Status};
+use sshinfo::ssh_server::{Ssh, SshServer};
+use sshinfo::{SshContext, SshResponse, ErrorCode};
+
+pub mod sshinfo {
+    tonic::include_proto!("sshinfo");
+}
+
+#[derive(Debug, Default)]
+pub struct SshContextService {}
+
+#[tonic::async_trait]
+impl Ssh for SshContextService {
+    async fn context_send(&self, request: Request<SshContext>) -> Result<Response<SshResponse>, Status> {
+        // Implementation for getting SSH context
+        println!("Received SSH context request: {:?}", request);
+
+        let reply = SshResponse {
+            successful: true,
+            error_code: Some(ErrorCode::EOk.into()),
+        };
+        Ok(Response::new(reply))
+    }
+}
+
 pub struct Epoll {
     epfd: i32,
     num_buffers: usize,
@@ -124,6 +149,14 @@ async fn main() -> anyhow::Result<()> {
     let program: &mut Lsm = ebpf.program_mut("bprm_check_security").unwrap().try_into()?;
     program.load("bprm_check_security", &btf)?;
     program.attach()?;
+
+    let addr = "[::1]:50051".parse()?;
+    let ssh_service = SshContextService::default();
+    
+    Server::builder()
+        .add_service(SshServer::new(ssh_service))
+        .serve(addr)
+        .await?;
 
     let mut perf_array = aya::maps::perf::PerfEventArray::try_from(ebpf.map_mut("EVENTS").unwrap())?;
     let mut perf_buffers = Vec::new();

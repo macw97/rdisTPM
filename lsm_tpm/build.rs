@@ -23,5 +23,6 @@ fn main() -> anyhow::Result<()> {
             .as_str(),
         ..Default::default()
     };
+    tonic_build::compile_protos("../proto/ssh_context.proto")?;
     aya_build::build_ebpf([ebpf_package], Toolchain::default())
 }
