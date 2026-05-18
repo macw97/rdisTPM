@@ -23,6 +23,13 @@ target
 # Generated linux header file.
 vmlinux.rs
 
+# Build directory and protobuf generated files
+build/
+*.grpc.pb.cc
+*.grpc.pb.h
+*.pb.cc
+*.pb.h
+
 # TPM context files and keys
 *.ctx
 *.pub
