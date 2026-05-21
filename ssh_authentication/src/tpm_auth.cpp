@@ -1,5 +1,11 @@
 #include <iostream>
 #include <cstring>
+#include "ssh_context_client.hpp"
+#include <grpcpp/grpcpp.h>
+#include <grpcpp/support/status.h>
+
+#include <ssh_context.grpc.pb.h>
+#include <ssh_context.pb.h>
 
 extern "C" {
     #include <syslog.h>
@@ -140,6 +146,10 @@ int main()
 
     secure_wipeout(username, sizeof(username));
     secure_wipeout(password, sizeof(password));
+    
+    int PID = getpid();
+    SSHClient ssh_client(grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials()));
+    ssh_client.SendContext(PID, true, sshinfo::OWNER_AUTHENTICATED);
 
 
     return 0; // Return 0 for successful authentication, 1 for failure
