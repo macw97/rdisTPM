@@ -1,0 +1,5 @@
+Cmnd_Alias SSH_CGROUP = \
+    /usr/bin/tee /sys/fs/cgroup/ssh_interactive/cgroup.procs, \
+    /usr/bin/tee /sys/fs/cgroup/ssh_non_interactive/cgroup.procs
+
+%ssh-users ALL=(root) NOPASSWD: SSH_CGROUP

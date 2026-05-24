@@ -26,38 +26,44 @@ extern "C" {
     TSS2_RC rc;
 }
 
+enum return_code {
+    E_OK = 0,
+    E_GENERAL_ERROR = 1,
+    E_TERMIOS_ERROR = 2,
+};
+
 int read_password_credentials(char *buffer_pass, size_t pass_size, char *buffer_user, size_t user_size) {
     struct termios _old, _new;
 
     if(tcgetattr(STDIN_FILENO, &_old) != 0) {
-        return -1;
+        return return_code::E_TERMIOS_ERROR;
     }
 
     _new = _old;
     _new.c_lflag &= ~ECHO;
 
     if(tcsetattr(STDIN_FILENO, TCSANOW, &_new) != 0) {
-        return -1;
+        return return_code::E_TERMIOS_ERROR;
     }
 
     printf("Enter TPM username: ");
     fflush(stdout);
     if(fgets(buffer_user, user_size, stdin) == NULL) {
         tcsetattr(STDIN_FILENO, TCSANOW, &_old);
-        return -1;
+        return return_code::E_TERMIOS_ERROR;
     }
 
     printf("\nEnter TPM password: ");
     fflush(stdout);
     if(fgets(buffer_pass, pass_size, stdin) == NULL) {
         tcsetattr(STDIN_FILENO, TCSANOW, &_old);
-        return -1;
+        return return_code::E_TERMIOS_ERROR;
     }
 
     tcsetattr(STDIN_FILENO, TCSANOW, &_old);
     buffer_user[strcspn(buffer_user, "\n")] = 0; // Remove newline character
     buffer_pass[strcspn(buffer_pass, "\n")] = 0; // Remove newline character
-    return 0;
+    return return_code::E_OK;
 }
 
 void secure_wipeout(void *v, size_t n) {
@@ -84,7 +90,7 @@ TSS2_RC load_sealed_object_from_tpm(ESYS_CONTEXT *ctx, ESYS_TR *sealed_handle) {
     return TSS2_RC_SUCCESS;
 }
 
-int main()
+int main(int argc, char *argv[])
 {
     ESYS_TR primary_handle = ESYS_TR_NONE;
     size_t primary_handle_size;
@@ -96,34 +102,47 @@ int main()
     TPM2B_PRIVATE priv = {0};
     ESYS_TR sealed = ESYS_TR_NONE;
     TPM2B_SENSITIVE_DATA *out = NULL;
+    int PID = getpid();
+
+    if(argc >= 2) {
+        if(strcmp(argv[1], "--non-interactive") == 0) {
+            syslog(LOG_INFO, "SSH auth: Running in non-interactive mode, skipping password prompt");
+            SSHClient ssh_client(grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials()));
+            ssh_client.SendContext(PID, false, sshinfo::NOT_TPM_AUTHENTICATED);
+            return return_code::E_OK;
+        } else {
+            syslog(LOG_ERR, "SSH auth: Invalid argument: %s", argv[1]);
+            return return_code::E_GENERAL_ERROR;
+        }
+    }
 
     rc = Tss2_TctiLdr_Initialize("device:/dev/tpmrm0", &tcti_ctx);
     if(rc != TSS2_RC_SUCCESS) {
         syslog(LOG_ERR, "SSH auth: Failed to initialize TCTI context: 0x%X", rc);
-        return 1;
+        return return_code::E_GENERAL_ERROR;
     }
 
     rc = Esys_Initialize(&ctx, tcti_ctx, NULL);
     if(rc != TSS2_RC_SUCCESS) {
         syslog(LOG_ERR, "SSH auth: Failed to initialize ESYS context: 0x%X", rc);
-        return 1;
+        return return_code::E_GENERAL_ERROR;
     }
 
     res = read_password_credentials(password, sizeof(password), username, sizeof(username));
     if(res != 0) {
         syslog(LOG_ERR, "SSH auth: Failed to read password credentials");
-        return 1;
+        return return_code::E_GENERAL_ERROR;
     }
     
     if(strcmp(username, "OWNER") != 0) {
         syslog(LOG_ERR, "SSH auth: Invalid username");
-        return 1;
+        return return_code::E_GENERAL_ERROR;
     }
     
     rc = load_sealed_object_from_tpm(ctx, &sealed);
     if(rc != TSS2_RC_SUCCESS) {
         syslog(LOG_ERR, "SSH auth: Failed to load sealed object from TPM: 0x%X", rc);
-        return 1;
+        return return_code::E_GENERAL_ERROR;
     }
 
     TPM2B_AUTH auth = {0};
@@ -133,13 +152,13 @@ int main()
     rc = Esys_TR_SetAuth(ctx, sealed, &auth);
     if(rc != TSS2_RC_SUCCESS) {
         syslog(LOG_ERR, "SSH auth: Failed to set auth value: 0x%X", rc);
-        return 1;
+        return return_code::E_GENERAL_ERROR;
     }
 
     rc = Esys_Unseal(ctx, sealed, ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE, &out);
     if(rc != TSS2_RC_SUCCESS) {
         syslog(LOG_ERR, "SSH auth: Failed to unseal data: 0x%X", rc);
-        return 1;
+        return return_code::E_GENERAL_ERROR;
     } else {
         syslog(LOG_INFO,"SSH auth successful");
     }
@@ -147,10 +166,9 @@ int main()
     secure_wipeout(username, sizeof(username));
     secure_wipeout(password, sizeof(password));
     
-    int PID = getpid();
     SSHClient ssh_client(grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials()));
     ssh_client.SendContext(PID, true, sshinfo::OWNER_AUTHENTICATED);
 
 
-    return 0; // Return 0 for successful authentication, 1 for failure
+    return return_code::E_OK; // Return 0 for successful authentication, 1 for failure
 }
