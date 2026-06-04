@@ -3,12 +3,16 @@ use aya::{Btf, programs::Lsm};
 use log::{debug, warn};
 use tokio::signal;
 use aya::maps::{perf, MapData};
+use aya::maps::HashMap;
+use std::fs;
+use std::sync::Arc;
 use aya::util::online_cpus;
 use bytes::BytesMut;
 use lsm_tpm_common::SecurityEvent;
 use libc::{epoll_create1, epoll_ctl, epoll_wait, EPOLL_CTL_ADD, epoll_event, EPOLLIN};
 use std::os::fd::AsRawFd;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 
 use tonic::{transport::Server, Request, Response, Status};
 use sshinfo::ssh_server::{Ssh, SshServer};
@@ -37,6 +41,7 @@ impl Ssh for SshContextService {
 
 pub struct Epoll {
     epfd: i32,
+    wake_fd: i32,
     num_buffers: usize,
 }
 
@@ -49,9 +54,22 @@ fn poll_buffers(perf_buffers: &Vec<perf::PerfEventArrayBuffer<&mut MapData>>) ->
     }
     println!("Created epoll instance with fd: {epollfd}");
 
+    let wake_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
+    if wake_fd < 0 {
+        println!("Failed to create eventfd for wakeup: {wake_fd}");
+        unsafe { libc::close(epollfd) };
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut wake_event = epoll_event {
+        events: EPOLLIN as u32,
+        u64: usize::MAX as u64, // Use a special value to identify wake events
+    };
+
+    unsafe { epoll_ctl(epollfd, EPOLL_CTL_ADD, wake_fd, &mut wake_event) };
+
     for (i, perf_buffer) in perf_buffers.iter().enumerate() {
         let fd = perf_buffer.as_raw_fd();
-        println!("Registering perf buffer {i} with fd: {fd} to epoll");
 
         let mut event = epoll_event {
             events: EPOLLIN as u32,
@@ -65,13 +83,66 @@ fn poll_buffers(perf_buffers: &Vec<perf::PerfEventArrayBuffer<&mut MapData>>) ->
         }
     }
     Ok(Epoll { 
-        epfd: epollfd, 
+        epfd: epollfd,
+        wake_fd,
         num_buffers: perf_buffers.len(),
     })
 }
 
+fn poll_and_handle_security_events(
+    pollfd: Arc<Epoll>,
+    mut perf_buffers: Vec<perf::PerfEventArrayBuffer<&mut MapData>>,
+    mut out_bufs: [bytes::BytesMut; 1],
+)  
+{
+    loop {
+
+        match pollfd.poll_readable() {
+            Ok(Some(indices)) => {
+                for idx in indices {
+                    if idx >= perf_buffers.len() {
+                        continue;
+                    }
+
+                    match perf_buffers[idx].read_events(&mut out_bufs) {
+                        Ok(_) => handle_security_event(&out_bufs[0]),
+                        Err(e) => eprintln!("Failed to read events from buffer {idx}: {e}"),
+                    }
+                }
+            }
+            Ok(None) => {
+                println!("Received wake event, stopping poll loop");
+                break;
+            }
+            Err(e) => {
+                eprintln!("Error during epoll wait: {e}");
+                break;
+            }
+        }
+    }
+
+}
+
+fn handle_security_event(buf: &bytes::BytesMut) {
+    let event: SecurityEvent = unsafe {
+        std::ptr::read_unaligned(buf.as_ptr() as *const SecurityEvent)
+    };
+
+    let filename_end = event._filename
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(event._filename.len());
+
+    let filename = String::from_utf8_lossy(&event._filename[..filename_end]);
+
+    println!(
+        "Received event: filename={}, uid={}, unsafe={}, cgroup_type={}",
+        filename, event._uid, event._unsafe, event._cgroup_type
+    );
+}
+
 impl Epoll {
-    pub fn poll_readable(&self) -> io::Result<Vec<usize>> {
+    pub fn poll_readable(&self) -> io::Result<Option<Vec<usize>>> {
         loop {
             let mut events = vec![epoll_event { events: 0, u64: 0 }; self.num_buffers];
             let nfds = unsafe { epoll_wait(self.epfd, events.as_mut_ptr(), events.len() as i32, -1) };
@@ -86,21 +157,34 @@ impl Epoll {
                 return Err(err);
             }
 
-            let mut ready_indices = Vec::new();
             for i in 0..nfds as usize {
-                let idx = events[i].u64 as usize;
-                ready_indices.push(idx);
+                if events[i].u64 == usize::MAX as u64 {
+                    return Ok(None); // Wake event, signal to stop polling
+                }
             }
-            return Ok(ready_indices);
+
+            let indices = (0..nfds as usize).map(|i| events[i].u64 as usize).collect();
+
+            return Ok(Some(indices));
+        }
+    }
+
+    pub fn wake(&self) {
+        let val: u64 = 1;
+        unsafe {
+            libc::write(self.wake_fd, &val as *const u64 as *const libc::c_void, 8);
         }
     }
 }
 
 impl Drop for Epoll {
     fn drop(&mut self) {
-        if self.epfd >= 0 {
-            unsafe { libc::close(self.epfd) };
-            println!("Closed epoll fd: {}", self.epfd);
+        if self.epfd >= 0 && self.wake_fd >= 0 {
+            unsafe { 
+                libc::close(self.epfd);
+                libc::close(self.wake_fd);
+            };
+            println!("Closed epoll fd: {} and wake fd: {}", self.epfd, self.wake_fd);
         }
     }
 }
@@ -124,11 +208,12 @@ async fn main() -> anyhow::Result<()> {
     // runtime. This approach is recommended for most real-world use cases. If you would
     // like to specify the eBPF program at runtime rather than at compile-time, you can
     // reach for `Bpf::load_file` instead.
-    let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
+    let ebpf = Box::leak(Box::new(aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/lsm_tpm"
-    )))?;
-    match aya_log::EbpfLogger::init(&mut ebpf) {
+    )))?));
+
+    match aya_log::EbpfLogger::init(ebpf) {
         Err(e) => {
             // This can happen if you remove all log statements from your eBPF program.
             warn!("failed to initialize eBPF logger: {e}");
@@ -151,12 +236,16 @@ async fn main() -> anyhow::Result<()> {
     program.attach()?;
 
     let addr = "[::1]:50051".parse()?;
-    let ssh_service = SshContextService::default();
     
-    Server::builder()
-        .add_service(SshServer::new(ssh_service))
-        .serve(addr)
-        .await?;
+    {
+        let mut cgroup_map: HashMap<_, u64, u32> = HashMap::try_from(ebpf.map_mut("CGROUP_MAP").unwrap())?;
+        let interactive_cgroup_id = fs::metadata("/sys/fs/cgroup/ssh_interactive")?.ino();
+        let non_interactive_cgroup_id = fs::metadata("/sys/fs/cgroup/ssh_non_interactive")?.ino();
+
+        cgroup_map.insert(interactive_cgroup_id, 1, 0)?;
+        cgroup_map.insert(non_interactive_cgroup_id, 2, 0)?;
+        println!("Inserted cgroup IDs into map: interactive={}, non-interactive={}", interactive_cgroup_id, non_interactive_cgroup_id);
+    }
 
     let mut perf_array = aya::maps::perf::PerfEventArray::try_from(ebpf.map_mut("EVENTS").unwrap())?;
     let mut perf_buffers = Vec::new();
@@ -164,41 +253,40 @@ async fn main() -> anyhow::Result<()> {
         perf_buffers.push(perf_array.open(cpu_id, None)?);
     }
 
-    let mut out_bufs = [bytes::BytesMut::with_capacity(1024)];
-    let pollfd = poll_buffers(&perf_buffers)?;
+    let out_bufs = [bytes::BytesMut::with_capacity(1024)];
+    let pollfd = Arc::new(poll_buffers(&perf_buffers)?);
+    let pollfd_clone = Arc::clone(&pollfd);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut grpc_handle = tokio::spawn(
+    Server::builder()
+        .add_service(SshServer::new(SshContextService::default()))
+        .serve_with_shutdown(addr, async { shutdown_rx.await.ok(); }),
+    );
+
+    std::thread::spawn(move || { 
+        poll_and_handle_security_events(pollfd_clone, perf_buffers, out_bufs);
+    });
 
     loop {
         tokio::select! {
-            _ = signal::ctrl_c() => {
+
+            _ = async { signal::ctrl_c().await } => {
                 println!("Received Ctrl-C, exiting...");
+                pollfd.wake(); // Ensure epoll fd is closed before exiting
+                let _ = shutdown_tx.send(()); // Signal gRPC server to shut down
                 break;
             }
 
-            result = async { pollfd.poll_readable() } => {
+            result = &mut grpc_handle => {  // watch for unexpected termination
                 match result {
-                    Ok(indices) => {
-                        for idx in indices {
-                            if idx < perf_buffers.len() {
-                                match perf_buffers[idx].read_events(&mut out_bufs) {
-                                    Ok(_events) => {
-                                        let event: SecurityEvent = unsafe {
-                                            std::ptr::read_unaligned(out_bufs[0].as_ptr() as *const SecurityEvent)
-                                        };
-                                        
-                                        // Convert filename byte array to C string (up to null terminator)
-                                        let filename_end = event._filename.iter().position(|&b| b == 0).unwrap_or(32);
-                                        let filename = String::from_utf8_lossy(&event._filename[..filename_end]);
-                                        
-                                        println!("Received event: filename={}, uid={}, unsafe={}", filename, event._uid, event._unsafe);
-                                    }
-                                    Err(e) => eprintln!("Failed to read events: {e}"),
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => eprintln!("Poll error: {e}"),
+                    Ok(Ok(())) => eprintln!("gRPC server stopped unexpectedly"),
+                    Ok(Err(e)) => eprintln!("gRPC server error: {e}"),
+                    Err(e)     => eprintln!("gRPC task panicked: {e}"),
                 }
+                break;
             }
+
         }
     }
 

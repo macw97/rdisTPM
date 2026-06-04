@@ -17,6 +17,7 @@ use aya_ebpf::{macros::lsm, programs::LsmContext};
 use aya_log_ebpf::info;
 use aya_ebpf::helpers;
 use aya_ebpf::maps::PerfEventArray;
+use aya_ebpf::maps::HashMap;
 use core::str;
 use aya_ebpf::macros::map;
 use vmlinux::linux_binprm;
@@ -25,6 +26,9 @@ use lsm_tpm_common::SecurityEvent;
 
 #[map(name="EVENTS")]
 static EVENTS: PerfEventArray<SecurityEvent> = PerfEventArray::new(0);
+
+#[map(name="CGROUP_MAP")]
+static CGROUP_MAP: HashMap<u64, u32> = HashMap::with_max_entries(4,0);
 
 #[lsm(hook = "bprm_check_security")]
 pub fn bprm_check_security(ctx: LsmContext) -> i32 {
@@ -48,14 +52,15 @@ unsafe fn try_bprm_check_security(ctx: LsmContext) -> Result<i32, i32> {
         };
 
         let filename = unsafe { str::from_utf8_unchecked(str_bytes) };
-        
+        let cgroup_id = unsafe { helpers::bpf_get_current_cgroup_id() };
+        let cgroup_type = unsafe { CGROUP_MAP.get(&cgroup_id) }.map(|t| *t).unwrap_or(0);
         let creds = bprm.cred;
         if creds.is_null() {
             info!(&ctx, "real_cred is null");
         } else {
             let uid = unsafe { (*creds).uid.val };
             let uns = bprm.unsafe_;
-            info!(&ctx, "filename: {} uid: {} unsafe: {}", filename, uid, uns);
+            info!(&ctx, "filename: {} uid: {} unsafe: {} cgroup_type: {}", filename, uid, uns, cgroup_type);
         }
         
         // Copy the actual bytes from buf into the event
@@ -67,9 +72,16 @@ unsafe fn try_bprm_check_security(ctx: LsmContext) -> Result<i32, i32> {
             _filename: filename_bytes,
             _uid: unsafe { (*creds).uid.val },
             _unsafe: bprm.unsafe_, 
+            _cgroup_type: cgroup_type,
         }; 
         
         EVENTS.output(&ctx, &event, 0);
+
+        return match cgroup_type {
+            1 => Ok(0),
+            2 => Ok(-1), // Deny non-interactive ssh
+            _ => Ok(0), // Shouldn't happen, but allow just in case
+        };
         
     }
 
