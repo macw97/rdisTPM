@@ -5,6 +5,7 @@ enum AuthenticationType {
         NOT_AUTHENTICATED = 0;
         NOT_TPM_AUTHENTICATED = 1;
         OWNER_AUTHENTICATED = 2;
+        OWNER_REAUTHENTICATED = 3;
 }
 
 message SSHContext {

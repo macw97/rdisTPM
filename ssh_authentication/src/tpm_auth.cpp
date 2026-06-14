@@ -1,5 +1,6 @@
 #include <iostream>
 #include <cstring>
+#include <cstdlib>
 #include "ssh_context_client.hpp"
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/support/status.h>
@@ -95,21 +96,31 @@ int main(int argc, char *argv[])
     ESYS_TR primary_handle = ESYS_TR_NONE;
     size_t primary_handle_size;
     int res = 0;
+    bool reauth = false;
     char username[32];
-    char password[32]; 
+    char password[32];
 
     TPM2B_PUBLIC pub = {0};
     TPM2B_PRIVATE priv = {0};
     ESYS_TR sealed = ESYS_TR_NONE;
     TPM2B_SENSITIVE_DATA *out = NULL;
     int PID = getpid();
+    SSHClient ssh_client(grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials()));
 
     if(argc >= 2) {
         if(strcmp(argv[1], "--non-interactive") == 0) {
             syslog(LOG_INFO, "SSH auth: Running in non-interactive mode, skipping password prompt");
-            SSHClient ssh_client(grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials()));
             ssh_client.SendContext(PID, false, sshinfo::NOT_TPM_AUTHENTICATED);
             return return_code::E_OK;
+        } else if (strcmp(argv[1], "--reauthenticate") == 0) {
+            reauth = true;
+            if(argc >= 3) {
+                PID = atoi(argv[2]);
+                if (PID <= 0) {
+                    syslog(LOG_ERR, "SSH auth: Invalid PID argument: %s", argv[2]);
+                    return return_code::E_GENERAL_ERROR;
+                }
+            }
         } else {
             syslog(LOG_ERR, "SSH auth: Invalid argument: %s", argv[1]);
             return return_code::E_GENERAL_ERROR;
@@ -119,29 +130,34 @@ int main(int argc, char *argv[])
     rc = Tss2_TctiLdr_Initialize("device:/dev/tpmrm0", &tcti_ctx);
     if(rc != TSS2_RC_SUCCESS) {
         syslog(LOG_ERR, "SSH auth: Failed to initialize TCTI context: 0x%X", rc);
+        ssh_client.SendContext(PID, false, sshinfo::NOT_TPM_AUTHENTICATED);
         return return_code::E_GENERAL_ERROR;
     }
 
     rc = Esys_Initialize(&ctx, tcti_ctx, NULL);
     if(rc != TSS2_RC_SUCCESS) {
         syslog(LOG_ERR, "SSH auth: Failed to initialize ESYS context: 0x%X", rc);
+        ssh_client.SendContext(PID, false, sshinfo::NOT_TPM_AUTHENTICATED);
         return return_code::E_GENERAL_ERROR;
     }
 
     res = read_password_credentials(password, sizeof(password), username, sizeof(username));
     if(res != 0) {
         syslog(LOG_ERR, "SSH auth: Failed to read password credentials");
+        ssh_client.SendContext(PID, false, sshinfo::NOT_TPM_AUTHENTICATED);
         return return_code::E_GENERAL_ERROR;
     }
     
     if(strcmp(username, "OWNER") != 0) {
         syslog(LOG_ERR, "SSH auth: Invalid username");
+        ssh_client.SendContext(PID, false, sshinfo::NOT_TPM_AUTHENTICATED);
         return return_code::E_GENERAL_ERROR;
     }
     
     rc = load_sealed_object_from_tpm(ctx, &sealed);
     if(rc != TSS2_RC_SUCCESS) {
         syslog(LOG_ERR, "SSH auth: Failed to load sealed object from TPM: 0x%X", rc);
+        ssh_client.SendContext(PID, false, sshinfo::NOT_TPM_AUTHENTICATED);
         return return_code::E_GENERAL_ERROR;
     }
 
@@ -152,12 +168,14 @@ int main(int argc, char *argv[])
     rc = Esys_TR_SetAuth(ctx, sealed, &auth);
     if(rc != TSS2_RC_SUCCESS) {
         syslog(LOG_ERR, "SSH auth: Failed to set auth value: 0x%X", rc);
+        ssh_client.SendContext(PID, false, sshinfo::NOT_TPM_AUTHENTICATED);
         return return_code::E_GENERAL_ERROR;
     }
 
     rc = Esys_Unseal(ctx, sealed, ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE, &out);
     if(rc != TSS2_RC_SUCCESS) {
         syslog(LOG_ERR, "SSH auth: Failed to unseal data: 0x%X", rc);
+        ssh_client.SendContext(PID, false, sshinfo::NOT_TPM_AUTHENTICATED);
         return return_code::E_GENERAL_ERROR;
     } else {
         syslog(LOG_INFO,"SSH auth successful");
@@ -166,9 +184,7 @@ int main(int argc, char *argv[])
     secure_wipeout(username, sizeof(username));
     secure_wipeout(password, sizeof(password));
     
-    SSHClient ssh_client(grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials()));
-    ssh_client.SendContext(PID, true, sshinfo::OWNER_AUTHENTICATED);
-
+    ssh_client.SendContext(PID, true, reauth ? sshinfo::OWNER_REAUTHENTICATED : sshinfo::OWNER_AUTHENTICATED);
 
     return return_code::E_OK; // Return 0 for successful authentication, 1 for failure
 }

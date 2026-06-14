@@ -15,7 +15,7 @@
 mod vmlinux;
 use aya_ebpf::{macros::lsm, programs::LsmContext};
 use aya_log_ebpf::info;
-use aya_ebpf::helpers;
+use aya_ebpf::helpers::{self, bpf_get_current_pid_tgid};
 use aya_ebpf::maps::PerfEventArray;
 use aya_ebpf::maps::HashMap;
 use core::str;
@@ -29,6 +29,7 @@ static EVENTS: PerfEventArray<SecurityEvent> = PerfEventArray::new(0);
 
 #[map(name="CGROUP_MAP")]
 static CGROUP_MAP: HashMap<u64, u32> = HashMap::with_max_entries(4,0);
+
 
 #[lsm(hook = "bprm_check_security")]
 pub fn bprm_check_security(ctx: LsmContext) -> i32 {
@@ -57,36 +58,42 @@ unsafe fn try_bprm_check_security(ctx: LsmContext) -> Result<i32, i32> {
         let creds = bprm.cred;
         if creds.is_null() {
             info!(&ctx, "real_cred is null");
-        } else {
-            let uid = unsafe { (*creds).uid.val };
-            let uns = bprm.unsafe_;
-            info!(&ctx, "filename: {} uid: {} unsafe: {} cgroup_type: {}", filename, uid, uns, cgroup_type);
         }
         
         // Copy the actual bytes from buf into the event
         let mut filename_bytes = [0u8; 32];
         let copy_len = str_bytes.len().min(32);
-        filename_bytes[..copy_len].copy_from_slice(&str_bytes[..copy_len]);
+        filename_bytes[..copy_len].copy_from_slice(&filename.as_bytes()[..copy_len]);
+        
+        let pid: u32 = bpf_get_current_pid_tgid() as u32;
+
+        let is_shell = filename == "/bin/bash"
+            || filename == "/bin/sh"
+            || filename == "/usr/bin/bash"
+            || filename == "/usr/bin/sh";
+        
         
         let event = SecurityEvent {
             _filename: filename_bytes,
             _uid: unsafe { (*creds).uid.val },
-            _unsafe: bprm.unsafe_, 
+            _pid: pid,
             _cgroup_type: cgroup_type,
+            _is_shell: is_shell,
         }; 
         
         EVENTS.output(&ctx, &event, 0);
 
-        return match cgroup_type {
-            1 => Ok(0),
-            2 => Ok(-1), // Deny non-interactive ssh
-            _ => Ok(0), // Shouldn't happen, but allow just in case
-        };
+        // return match cgroup_type {
+        //     1 => Ok(0),
+        //     2 => Ok(-1), // Deny non-interactive ssh
+        //     _ => Ok(0), // Shouldn't happen, but allow just in case
+        // };
         
     }
 
     Ok(0)
 }
+
 
 #[cfg(not(test))]
 #[panic_handler]

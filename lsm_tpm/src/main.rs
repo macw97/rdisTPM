@@ -13,10 +13,15 @@ use libc::{epoll_create1, epoll_ctl, epoll_wait, EPOLL_CTL_ADD, epoll_event, EPO
 use std::os::fd::AsRawFd;
 use std::io;
 use std::os::unix::fs::MetadataExt;
+use std::os::fd::FromRawFd;
+use std::os::fd::IntoRawFd;
 
 use tonic::{transport::Server, Request, Response, Status};
 use sshinfo::ssh_server::{Ssh, SshServer};
 use sshinfo::{SshContext, SshResponse, ErrorCode};
+
+const PERF_HEADER_SIZE: usize = 8;
+const EVENT_SIZE: usize = std::mem::size_of::<SecurityEvent>() + PERF_HEADER_SIZE;
 
 pub mod sshinfo {
     tonic::include_proto!("sshinfo");
@@ -30,6 +35,15 @@ impl Ssh for SshContextService {
     async fn context_send(&self, request: Request<SshContext>) -> Result<Response<SshResponse>, Status> {
         // Implementation for getting SSH context
         println!("Received SSH context request: {:?}", request);
+
+        let ctx = request.into_inner();
+
+        if ctx.auth == sshinfo::AuthenticationType::OwnerReauthenticated.into() {
+            fs::write("/sys/fs/cgroup/ssh_interactive/cgroup.procs", format!("{}\n", ctx.pid)
+            ).map_err(|e| Status::internal(e.to_string()))?;
+
+            println!("Migrated pid={} to interactive cgroup", ctx.pid);
+        }
 
         let reply = SshResponse {
             successful: true,
@@ -70,7 +84,7 @@ fn poll_buffers(perf_buffers: &Vec<perf::PerfEventArrayBuffer<&mut MapData>>) ->
 
     for (i, perf_buffer) in perf_buffers.iter().enumerate() {
         let fd = perf_buffer.as_raw_fd();
-
+        println!("Registering CPU {i} perf buffer fd={fd} to epoll");
         let mut event = epoll_event {
             events: EPOLLIN as u32,
             u64: i as u64, // Use the index as the user data
@@ -92,7 +106,7 @@ fn poll_buffers(perf_buffers: &Vec<perf::PerfEventArrayBuffer<&mut MapData>>) ->
 fn poll_and_handle_security_events(
     pollfd: Arc<Epoll>,
     mut perf_buffers: Vec<perf::PerfEventArrayBuffer<&mut MapData>>,
-    mut out_bufs: [bytes::BytesMut; 1],
+    mut out_bufs: [bytes::BytesMut; 64],
 )  
 {
     loop {
@@ -104,9 +118,19 @@ fn poll_and_handle_security_events(
                         continue;
                     }
 
-                    match perf_buffers[idx].read_events(&mut out_bufs) {
-                        Ok(_) => handle_security_event(&out_bufs[0]),
-                        Err(e) => eprintln!("Failed to read events from buffer {idx}: {e}"),
+                    loop {
+                        match perf_buffers[idx].read_events(&mut out_bufs) {
+                            Ok(events) if events.read == 0 => break,
+                            Ok(events) => {
+                                if events.lost > 0 {
+                                    println!("Warning: Lost {} events on CPU {}", events.lost, idx);
+                                }
+                                for buf in out_bufs.iter().take(events.read) { 
+                                    handle_security_event(buf);
+                                }
+                            },
+                            Err(e) => eprintln!("Failed to read events from buffer {idx}: {e}"),
+                        }
                     }
                 }
             }
@@ -123,6 +147,64 @@ fn poll_and_handle_security_events(
 
 }
 
+fn get_tty_of_pid(pid: u32) -> io::Result<String> {
+    let link = std::fs::read_link(format!("/proc/{pid}/fd/0"))?;
+    Ok(link.to_string_lossy().to_string())
+}
+
+fn has_pty(pid: u32) -> bool {
+    if let Ok(link) = std::fs::read_link(format!("/proc/{pid}/fd/0")) {
+        link.to_string_lossy().starts_with("/dev/pts/")
+    } else {
+        false
+    }
+}
+
+fn run_2fa(pid: u32) -> io::Result<()> {
+    let tty_path = get_tty_of_pid(pid)?;
+
+    unsafe { libc::kill(pid as i32, libc::SIGSTOP) }; // Stop the process until 2FA is done
+    let tty_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tty_path)?;
+
+    let tty_fd = tty_file.into_raw_fd();
+
+    let tty_fd_out = unsafe { libc::dup(tty_fd) };
+    let tty_fd_err = unsafe { libc::dup(tty_fd) };
+
+    let mut child =
+        std::process::Command::new("/usr/local/bin/tpm_auth")
+            .arg("--reauthenticate")
+            .arg(pid.to_string())
+            .stdin(unsafe { std::process::Stdio::from_raw_fd(tty_fd) })
+            .stdout(unsafe { std::process::Stdio::from_raw_fd(tty_fd_out) })
+            .stderr(unsafe { std::process::Stdio::from_raw_fd(tty_fd_err) })
+            .spawn()?;
+
+    let status = child.wait()?;
+    unsafe { libc::kill(pid as i32, libc::SIGCONT) }; // Continue the process after 2FA is done
+
+    if status.success() {
+        println!("2FA successful for pid {pid}");
+    } else {
+        println!("2FA failed for pid {pid}, status: {status}");
+    }
+
+    Ok(())
+}
+
+fn trigger_2fa_for_pid(pid: u32) {
+    
+    std::thread::spawn(move || {
+        if let Err(e) = run_2fa(pid) {
+            eprintln!("Error during 2FA for pid {pid}: {e}");
+            unsafe { libc::kill(pid as i32, libc::SIGCONT) }; // Ensure process is continued even if 2FA fails
+        }
+    });
+}
+
 fn handle_security_event(buf: &bytes::BytesMut) {
     let event: SecurityEvent = unsafe {
         std::ptr::read_unaligned(buf.as_ptr() as *const SecurityEvent)
@@ -134,10 +216,16 @@ fn handle_security_event(buf: &bytes::BytesMut) {
         .unwrap_or(event._filename.len());
 
     let filename = String::from_utf8_lossy(&event._filename[..filename_end]);
-
+    if event._is_shell && (filename == "/bin/bash" || filename == "/usr/bin/bash") {
+        if has_pty(event._pid) {
+            println!("Received shell open event pid: {}, cgroup_type: {}", event._pid, event._cgroup_type);
+            trigger_2fa_for_pid(event._pid);
+        }
+    }
+    
     println!(
-        "Received event: filename={}, uid={}, unsafe={}, cgroup_type={}",
-        filename, event._uid, event._unsafe, event._cgroup_type
+        "Received event: filename={}, uid={}, pid={}, cgroup_type={}",
+        filename, event._uid, event._pid, event._cgroup_type
     );
 }
 
@@ -234,7 +322,7 @@ async fn main() -> anyhow::Result<()> {
     let program: &mut Lsm = ebpf.program_mut("bprm_check_security").unwrap().try_into()?;
     program.load("bprm_check_security", &btf)?;
     program.attach()?;
-
+    
     let addr = "[::1]:50051".parse()?;
     
     {
@@ -253,7 +341,7 @@ async fn main() -> anyhow::Result<()> {
         perf_buffers.push(perf_array.open(cpu_id, None)?);
     }
 
-    let out_bufs = [bytes::BytesMut::with_capacity(1024)];
+    let mut out_bufs: [BytesMut; 64] = std::array::from_fn(|_| BytesMut::with_capacity(EVENT_SIZE));
     let pollfd = Arc::new(poll_buffers(&perf_buffers)?);
     let pollfd_clone = Arc::clone(&pollfd);
 
