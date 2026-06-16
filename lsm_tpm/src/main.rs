@@ -1,27 +1,29 @@
 use aya::{Btf, programs::Lsm};
-#[rustfmt::skip]
-use log::{debug, warn};
-use tokio::signal;
-use aya::maps::{perf, MapData};
-use aya::maps::HashMap;
-use std::fs;
-use std::sync::Arc;
+use aya::maps::{perf, MapData, HashMap};
 use aya::util::online_cpus;
 use bytes::BytesMut;
 use lsm_tpm_common::SecurityEvent;
+use log::{debug, warn, error, info};
 use libc::{epoll_create1, epoll_ctl, epoll_wait, EPOLL_CTL_ADD, epoll_event, EPOLLIN};
-use std::os::fd::AsRawFd;
+use std::fs;
 use std::io;
+use std::os::fd::{FromRawFd, IntoRawFd, AsRawFd};
 use std::os::unix::fs::MetadataExt;
-use std::os::fd::FromRawFd;
-use std::os::fd::IntoRawFd;
-
+use std::sync::Arc;
+use tokio::signal;
 use tonic::{transport::Server, Request, Response, Status};
 use sshinfo::ssh_server::{Ssh, SshServer};
 use sshinfo::{SshContext, SshResponse, ErrorCode};
 
+// Configuration constants
 const PERF_HEADER_SIZE: usize = 8;
 const EVENT_SIZE: usize = std::mem::size_of::<SecurityEvent>() + PERF_HEADER_SIZE;
+const MAX_BUFFERS: usize = 64;
+const WAKE_EVENT_MARKER: u64 = usize::MAX as u64;
+const TPM_AUTH_PATH: &str = "/usr/local/bin/tpm_auth";
+const INTERACTIVE_CGROUP_PATH: &str = "/sys/fs/cgroup/ssh_interactive/cgroup.procs";
+const SHELL_PATHS: &[&str] = &["/bin/bash", "/usr/bin/bash"];
+const GRPC_ADDR: &str = "[::1]:50051";
 
 pub mod sshinfo {
     tonic::include_proto!("sshinfo");
@@ -33,23 +35,21 @@ pub struct SshContextService {}
 #[tonic::async_trait]
 impl Ssh for SshContextService {
     async fn context_send(&self, request: Request<SshContext>) -> Result<Response<SshResponse>, Status> {
-        // Implementation for getting SSH context
-        println!("Received SSH context request: {:?}", request);
-
         let ctx = request.into_inner();
+        debug!("Received SSH context request: {:?}", ctx);
 
         if ctx.auth == sshinfo::AuthenticationType::OwnerReauthenticated.into() {
-            fs::write("/sys/fs/cgroup/ssh_interactive/cgroup.procs", format!("{}\n", ctx.pid)
-            ).map_err(|e| Status::internal(e.to_string()))?;
-
-            println!("Migrated pid={} to interactive cgroup", ctx.pid);
+            if let Err(e) = fs::write(INTERACTIVE_CGROUP_PATH, format!("{}\n", ctx.pid)) {
+                error!("Failed to migrate pid {} to interactive cgroup: {}", ctx.pid, e);
+                return Err(Status::internal(format!("Cgroup migration failed: {}", e)));
+            }
+            info!("Migrated pid={} to interactive cgroup", ctx.pid);
         }
 
-        let reply = SshResponse {
+        Ok(Response::new(SshResponse {
             successful: true,
             error_code: Some(ErrorCode::EOk.into()),
-        };
-        Ok(Response::new(reply))
+        }))
     }
 }
 
@@ -59,43 +59,47 @@ pub struct Epoll {
     num_buffers: usize,
 }
 
-fn poll_buffers(perf_buffers: &Vec<perf::PerfEventArrayBuffer<&mut MapData>>) -> io::Result<Epoll> {
+fn poll_buffers(perf_buffers: &[perf::PerfEventArrayBuffer<&mut MapData>]) -> io::Result<Epoll> {
+    // SAFETY: epoll_create1 is safe to call with 0 flags and handles errors via return value
     let epollfd = unsafe { epoll_create1(0) };
-    
     if epollfd < 0 {
-        println!("Something wrong with epoll!");
         return Err(io::Error::last_os_error());
     }
-    println!("Created epoll instance with fd: {epollfd}");
 
+    // SAFETY: eventfd with EFD_NONBLOCK is safe and returns error via fd value
     let wake_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
     if wake_fd < 0 {
-        println!("Failed to create eventfd for wakeup: {wake_fd}");
         unsafe { libc::close(epollfd) };
         return Err(io::Error::last_os_error());
     }
 
     let mut wake_event = epoll_event {
         events: EPOLLIN as u32,
-        u64: usize::MAX as u64, // Use a special value to identify wake events
+        u64: WAKE_EVENT_MARKER,
     };
 
+    // SAFETY: epoll_ctl is safe here with valid fds
     unsafe { epoll_ctl(epollfd, EPOLL_CTL_ADD, wake_fd, &mut wake_event) };
 
     for (i, perf_buffer) in perf_buffers.iter().enumerate() {
         let fd = perf_buffer.as_raw_fd();
-        println!("Registering CPU {i} perf buffer fd={fd} to epoll");
         let mut event = epoll_event {
             events: EPOLLIN as u32,
-            u64: i as u64, // Use the index as the user data
+            u64: i as u64,
         };
 
+        // SAFETY: epoll_ctl is safe with valid fds
         let res = unsafe { epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &mut event) };
         if res < 0 {
-            println!("Failed to add fd {fd} to epoll: {res}");
+            unsafe { 
+                libc::close(wake_fd);
+                libc::close(epollfd);
+            }
             return Err(io::Error::last_os_error());
         }
     }
+
+    debug!("Created epoll with {} perf buffers", perf_buffers.len());
     Ok(Epoll { 
         epfd: epollfd,
         wake_fd,
@@ -106,11 +110,9 @@ fn poll_buffers(perf_buffers: &Vec<perf::PerfEventArrayBuffer<&mut MapData>>) ->
 fn poll_and_handle_security_events(
     pollfd: Arc<Epoll>,
     mut perf_buffers: Vec<perf::PerfEventArrayBuffer<&mut MapData>>,
-    mut out_bufs: [bytes::BytesMut; 64],
-)  
-{
+    mut out_bufs: [BytesMut; MAX_BUFFERS],
+) {
     loop {
-
         match pollfd.poll_readable() {
             Ok(Some(indices)) => {
                 for idx in indices {
@@ -123,135 +125,175 @@ fn poll_and_handle_security_events(
                             Ok(events) if events.read == 0 => break,
                             Ok(events) => {
                                 if events.lost > 0 {
+                                    warn!("Lost {} events on CPU {}", events.lost, idx);
                                     println!("Warning: Lost {} events on CPU {}", events.lost, idx);
                                 }
-                                for buf in out_bufs.iter().take(events.read) { 
+                                for buf in out_bufs.iter().take(events.read) {
                                     handle_security_event(buf);
                                 }
-                            },
-                            Err(e) => eprintln!("Failed to read events from buffer {idx}: {e}"),
+                            }
+                            Err(e) => {
+                                error!("Failed to read events from buffer {}: {}", idx, e);
+                                eprintln!("Failed to read events from buffer {}: {}", idx, e);
+                                break;
+                            }
                         }
                     }
                 }
             }
             Ok(None) => {
-                println!("Received wake event, stopping poll loop");
+                info!("Received wake event, stopping poll loop");
                 break;
             }
             Err(e) => {
-                eprintln!("Error during epoll wait: {e}");
+                error!("Error during epoll wait: {}", e);
+                eprintln!("Error during epoll wait: {}", e);
                 break;
             }
         }
     }
-
 }
 
 fn get_tty_of_pid(pid: u32) -> io::Result<String> {
-    let link = std::fs::read_link(format!("/proc/{pid}/fd/0"))?;
-    Ok(link.to_string_lossy().to_string())
+
+    if pid == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "PID cannot be 0"));
+    }
+
+    let fd_path = format!("/proc/{}/fd/0", pid);
+    let link = fs::read_link(&fd_path)?;
+    let tty_path = link.to_string_lossy().to_string();
+
+    // Basic validation: ensure it points to a TTY
+    if !tty_path.starts_with("/dev/") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Invalid TTY path: {}", tty_path),
+        ));
+    }
+
+    Ok(tty_path)
 }
 
 fn has_pty(pid: u32) -> bool {
-    if let Ok(link) = std::fs::read_link(format!("/proc/{pid}/fd/0")) {
-        link.to_string_lossy().starts_with("/dev/pts/")
-    } else {
-        false
-    }
+    get_tty_of_pid(pid)
+        .ok()
+        .map(|path| path.starts_with("/dev/pts/"))
+        .unwrap_or(false)
 }
 
 fn run_2fa(pid: u32) -> io::Result<()> {
     let tty_path = get_tty_of_pid(pid)?;
 
-    unsafe { libc::kill(pid as i32, libc::SIGSTOP) }; // Stop the process until 2FA is done
-    let tty_file = std::fs::OpenOptions::new()
+    // SAFETY: SIGSTOP is to suspend concurent access to the TTY and pid is validated in get_tty_of_pid
+    unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
+
+    let tty_file = fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(tty_path)?;
+        .open(&tty_path)?;
 
+    // SAFETY: into_raw_fd is safe here as we own the file handle
     let tty_fd = tty_file.into_raw_fd();
 
+    // SAFETY: dup with a valid fd is safe
     let tty_fd_out = unsafe { libc::dup(tty_fd) };
     let tty_fd_err = unsafe { libc::dup(tty_fd) };
 
-    let mut child =
-        std::process::Command::new("/usr/local/bin/tpm_auth")
-            .arg("--reauthenticate")
-            .arg(pid.to_string())
-            .stdin(unsafe { std::process::Stdio::from_raw_fd(tty_fd) })
-            .stdout(unsafe { std::process::Stdio::from_raw_fd(tty_fd_out) })
-            .stderr(unsafe { std::process::Stdio::from_raw_fd(tty_fd_err) })
-            .spawn()?;
-
-    let status = child.wait()?;
-    unsafe { libc::kill(pid as i32, libc::SIGCONT) }; // Continue the process after 2FA is done
-
-    if status.success() {
-        println!("2FA successful for pid {pid}");
-    } else {
-        println!("2FA failed for pid {pid}, status: {status}");
+    if tty_fd_out < 0 || tty_fd_err < 0 {
+        unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+        return Err(io::Error::last_os_error());
     }
 
-    Ok(())
+    let status = std::process::Command::new(TPM_AUTH_PATH)
+        .arg("--reauthenticate")
+        .arg(pid.to_string())
+        .stdin(unsafe { std::process::Stdio::from_raw_fd(tty_fd) })
+        .stdout(unsafe { std::process::Stdio::from_raw_fd(tty_fd_out) })
+        .stderr(unsafe { std::process::Stdio::from_raw_fd(tty_fd_err) })
+        .status()?;
+
+    // SAFETY: SIGCONT to stoped process after 2FA authentication
+    unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+
+    if status.success() {
+        info!("2FA authentication successful for pid {}", pid);
+        Ok(())
+    } else {
+        error!("2FA authentication failed for pid {}: {}", pid, status);
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("2FA failed: {}", status),
+        ))
+    }
 }
 
 fn trigger_2fa_for_pid(pid: u32) {
-    
     std::thread::spawn(move || {
         if let Err(e) = run_2fa(pid) {
-            eprintln!("Error during 2FA for pid {pid}: {e}");
-            unsafe { libc::kill(pid as i32, libc::SIGCONT) }; // Ensure process is continued even if 2FA fails
+            error!("2FA failed for pid {}: {}", pid, e);
+            unsafe { libc::kill(pid as i32, libc::SIGCONT) };
         }
     });
 }
 
-fn handle_security_event(buf: &bytes::BytesMut) {
+fn handle_security_event(buf: &BytesMut) {
+    // SAFETY: SecurityEvent is a POD type read from kernel, unaligned read is necessary
+    // as perf buffers may not guarantee alignment
     let event: SecurityEvent = unsafe {
         std::ptr::read_unaligned(buf.as_ptr() as *const SecurityEvent)
     };
 
+    // Extract null-terminated filename string
     let filename_end = event._filename
         .iter()
         .position(|&b| b == 0)
         .unwrap_or(event._filename.len());
 
     let filename = String::from_utf8_lossy(&event._filename[..filename_end]);
-    if event._is_shell && (filename == "/bin/bash" || filename == "/usr/bin/bash") {
+
+    // Log all received events for traceability
+    info!(
+        "Received event: filename={}, uid={}, pid={}, cgroup_type={}, is_shell={}",
+        filename, event._uid, event._pid, event._cgroup_type, event._is_shell
+    );
+
+    if event._is_shell && SHELL_PATHS.contains(&filename.as_ref()) && event._cgroup_type == 2 {
         if has_pty(event._pid) {
-            println!("Received shell open event pid: {}, cgroup_type: {}", event._pid, event._cgroup_type);
+            info!("Triggering 2FA for shell process: pid={}, cgroup_type={}", event._pid, event._cgroup_type);
             trigger_2fa_for_pid(event._pid);
         }
     }
-    
-    println!(
-        "Received event: filename={}, uid={}, pid={}, cgroup_type={}",
-        filename, event._uid, event._pid, event._cgroup_type
-    );
 }
 
 impl Epoll {
     pub fn poll_readable(&self) -> io::Result<Option<Vec<usize>>> {
         loop {
             let mut events = vec![epoll_event { events: 0, u64: 0 }; self.num_buffers];
-            let nfds = unsafe { epoll_wait(self.epfd, events.as_mut_ptr(), events.len() as i32, -1) };
             
+            // SAFETY: epoll_wait is safe with valid epfd and event array
+            let nfds = unsafe { 
+                epoll_wait(self.epfd, events.as_mut_ptr(), events.len() as i32, -1) 
+            };
+
             if nfds < 0 {
                 let err = io::Error::last_os_error();
                 // Retry on EINTR (interrupted system call)
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                println!("Error during epoll_wait: {nfds}");
                 return Err(err);
             }
 
             for i in 0..nfds as usize {
-                if events[i].u64 == usize::MAX as u64 {
+                if events[i].u64 == WAKE_EVENT_MARKER {
                     return Ok(None); // Wake event, signal to stop polling
                 }
             }
 
-            let indices = (0..nfds as usize).map(|i| events[i].u64 as usize).collect();
+            let indices = (0..nfds as usize)
+                .map(|i| events[i].u64 as usize)
+                .collect();
 
             return Ok(Some(indices));
         }
@@ -259,6 +301,7 @@ impl Epoll {
 
     pub fn wake(&self) {
         let val: u64 = 1;
+        // SAFETY: write to a valid eventfd is safe
         unsafe {
             libc::write(self.wake_fd, &val as *const u64 as *const libc::c_void, 8);
         }
@@ -268,11 +311,12 @@ impl Epoll {
 impl Drop for Epoll {
     fn drop(&mut self) {
         if self.epfd >= 0 && self.wake_fd >= 0 {
-            unsafe { 
+            // SAFETY: close is safe on valid fds; we only call this once via Drop
+            unsafe {
                 libc::close(self.epfd);
                 libc::close(self.wake_fd);
-            };
-            println!("Closed epoll fd: {} and wake fd: {}", self.epfd, self.wake_fd);
+            }
+            debug!("Closed epoll fd: {} and wake fd: {}", self.epfd, self.wake_fd);
         }
     }
 }
@@ -323,7 +367,7 @@ async fn main() -> anyhow::Result<()> {
     program.load("bprm_check_security", &btf)?;
     program.attach()?;
     
-    let addr = "[::1]:50051".parse()?;
+    let addr = GRPC_ADDR.parse()?;
     
     {
         let mut cgroup_map: HashMap<_, u64, u32> = HashMap::try_from(ebpf.map_mut("CGROUP_MAP").unwrap())?;
@@ -332,7 +376,7 @@ async fn main() -> anyhow::Result<()> {
 
         cgroup_map.insert(interactive_cgroup_id, 1, 0)?;
         cgroup_map.insert(non_interactive_cgroup_id, 2, 0)?;
-        println!("Inserted cgroup IDs into map: interactive={}, non-interactive={}", interactive_cgroup_id, non_interactive_cgroup_id);
+        info!("Inserted cgroup IDs into map: interactive={}, non-interactive={}", interactive_cgroup_id, non_interactive_cgroup_id);
     }
 
     let mut perf_array = aya::maps::perf::PerfEventArray::try_from(ebpf.map_mut("EVENTS").unwrap())?;
@@ -341,15 +385,17 @@ async fn main() -> anyhow::Result<()> {
         perf_buffers.push(perf_array.open(cpu_id, None)?);
     }
 
-    let mut out_bufs: [BytesMut; 64] = std::array::from_fn(|_| BytesMut::with_capacity(EVENT_SIZE));
+    let out_bufs: [BytesMut; MAX_BUFFERS] = std::array::from_fn(|_| BytesMut::with_capacity(EVENT_SIZE));
     let pollfd = Arc::new(poll_buffers(&perf_buffers)?);
     let pollfd_clone = Arc::clone(&pollfd);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let mut grpc_handle = tokio::spawn(
-    Server::builder()
-        .add_service(SshServer::new(SshContextService::default()))
-        .serve_with_shutdown(addr, async { shutdown_rx.await.ok(); }),
+        Server::builder()
+            .add_service(SshServer::new(SshContextService::default()))
+            .serve_with_shutdown(addr, async { 
+                let _ = shutdown_rx.await;
+            }),
     );
 
     std::thread::spawn(move || { 
@@ -358,26 +404,23 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         tokio::select! {
-
-            _ = async { signal::ctrl_c().await } => {
-                println!("Received Ctrl-C, exiting...");
-                pollfd.wake(); // Ensure epoll fd is closed before exiting
-                let _ = shutdown_tx.send(()); // Signal gRPC server to shut down
+            _ = signal::ctrl_c() => {
+                info!("Received Ctrl-C, exiting...");
+                pollfd.wake();
+                let _ = shutdown_tx.send(());
                 break;
             }
-
-            result = &mut grpc_handle => {  // watch for unexpected termination
+            result = &mut grpc_handle => {
                 match result {
-                    Ok(Ok(())) => eprintln!("gRPC server stopped unexpectedly"),
-                    Ok(Err(e)) => eprintln!("gRPC server error: {e}"),
-                    Err(e)     => eprintln!("gRPC task panicked: {e}"),
+                    Ok(Ok(())) => error!("gRPC server stopped unexpectedly"),
+                    Ok(Err(e)) => error!("gRPC server error: {e}"),
+                    Err(e)     => error!("gRPC task panicked: {e}"),
                 }
                 break;
             }
-
         }
     }
 
-    println!("Exiting...");
+    info!("Exiting...");
     Ok(())
 }
