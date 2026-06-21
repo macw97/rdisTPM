@@ -121,6 +121,14 @@ int main(int argc, char *argv[])
                     return return_code::E_GENERAL_ERROR;
                 }
             }
+        } else if (strcmp(argv[1], "--interactive") == 0) {
+            if(argc >= 3) {
+                PID = atoi(argv[2]);
+                if(PID <= 0) {
+                    syslog(LOG_ERR, "SSH auth: Invalid PID argument: %s", argv[2]);
+                    return return_code::E_GENERAL_ERROR;
+                }
+            }
         } else {
             syslog(LOG_ERR, "SSH auth: Invalid argument: %s", argv[1]);
             return return_code::E_GENERAL_ERROR;

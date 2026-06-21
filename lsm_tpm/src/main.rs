@@ -1,5 +1,5 @@
 use aya::{Btf, programs::Lsm};
-use aya::maps::{perf, MapData, HashMap};
+use aya::maps::{perf, MapData, HashMap, Array};
 use aya::util::online_cpus;
 use bytes::BytesMut;
 use lsm_tpm_common::SecurityEvent;
@@ -14,6 +14,8 @@ use tokio::signal;
 use tonic::{transport::Server, Request, Response, Status};
 use sshinfo::ssh_server::{Ssh, SshServer};
 use sshinfo::{SshContext, SshResponse, ErrorCode};
+use serde::Deserialize;
+use serde_json;
 
 // Configuration constants
 const PERF_HEADER_SIZE: usize = 8;
@@ -22,12 +24,20 @@ const MAX_BUFFERS: usize = 64;
 const WAKE_EVENT_MARKER: u64 = usize::MAX as u64;
 const TPM_AUTH_PATH: &str = "/usr/local/bin/tpm_auth";
 const INTERACTIVE_CGROUP_PATH: &str = "/sys/fs/cgroup/ssh_interactive/cgroup.procs";
+const BLACKLIST_PATH: &str = "blacklist.json";
 const SHELL_PATHS: &[&str] = &["/bin/bash", "/usr/bin/bash"];
 const GRPC_ADDR: &str = "[::1]:50051";
 
 pub mod sshinfo {
     tonic::include_proto!("sshinfo");
 }
+
+#[derive(Deserialize)]
+struct Blacklist {
+    binaries: Vec<String>,
+    paths: Vec<String>,
+}
+
 
 #[derive(Debug, Default)]
 pub struct SshContextService {}
@@ -38,7 +48,8 @@ impl Ssh for SshContextService {
         let ctx = request.into_inner();
         debug!("Received SSH context request: {:?}", ctx);
 
-        if ctx.auth == sshinfo::AuthenticationType::OwnerReauthenticated.into() {
+        if ctx.auth == sshinfo::AuthenticationType::OwnerReauthenticated as i32 ||
+           ctx.auth == sshinfo::AuthenticationType::OwnerAuthenticated as i32 {
             if let Err(e) = fs::write(INTERACTIVE_CGROUP_PATH, format!("{}\n", ctx.pid)) {
                 error!("Failed to migrate pid {} to interactive cgroup: {}", ctx.pid, e);
                 return Err(Status::internal(format!("Cgroup migration failed: {}", e)));
@@ -321,6 +332,34 @@ impl Drop for Epoll {
     }
 }
 
+fn load_blacklist(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
+    let content = std::fs::read_to_string(BLACKLIST_PATH)?;
+    let blacklist: Blacklist = serde_json::from_str(&content)?;
+
+    let mut blacklist_map: HashMap<_, [u8; 64], u8> = HashMap::try_from(ebpf.map_mut("BLACKLIST_MAP").unwrap())?;
+    for binary in blacklist.binaries {
+        let mut key = [0u8; 64];
+        let bytes = binary.as_bytes();
+        let len = bytes.len().min(64);
+        key[..len].copy_from_slice(&bytes[..len]);
+
+        blacklist_map.insert(key, 1, 0)?;
+    }
+
+    let mut paths: Array<_, [u8; 64]> = Array::try_from(ebpf.map_mut("BLACKLIST_PATHS").unwrap())?;
+
+    for (idx,path) in blacklist.paths.iter().enumerate() {
+        let mut key = [0u8; 64];
+        let bytes = path.as_bytes();
+        let len = bytes.len().min(64);
+        key[..len].copy_from_slice(&bytes[..len]);
+
+        paths.set(idx as u32, key, 0)?;
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -366,6 +405,12 @@ async fn main() -> anyhow::Result<()> {
     let program: &mut Lsm = ebpf.program_mut("bprm_check_security").unwrap().try_into()?;
     program.load("bprm_check_security", &btf)?;
     program.attach()?;
+
+    let fp_program: &mut Lsm = ebpf.program_mut("file_permission").unwrap().try_into()?;
+    fp_program.load("file_permission", &btf)?;
+    fp_program.attach()?;
+
+    load_blacklist(ebpf)?;
     
     let addr = GRPC_ADDR.parse()?;
     
@@ -373,10 +418,18 @@ async fn main() -> anyhow::Result<()> {
         let mut cgroup_map: HashMap<_, u64, u32> = HashMap::try_from(ebpf.map_mut("CGROUP_MAP").unwrap())?;
         let interactive_cgroup_id = fs::metadata("/sys/fs/cgroup/ssh_interactive")?.ino();
         let non_interactive_cgroup_id = fs::metadata("/sys/fs/cgroup/ssh_non_interactive")?.ino();
+        let interactive_procs_id = fs::metadata(INTERACTIVE_CGROUP_PATH)?.ino();
 
         cgroup_map.insert(interactive_cgroup_id, 1, 0)?;
         cgroup_map.insert(non_interactive_cgroup_id, 2, 0)?;
-        info!("Inserted cgroup IDs into map: interactive={}, non-interactive={}", interactive_cgroup_id, non_interactive_cgroup_id);
+        cgroup_map.insert(interactive_procs_id, 3, 0)?;
+        
+        info!("Inserted cgroup IDs into map: interactive={}, non-interactive={} interactive-procs={}", interactive_cgroup_id, non_interactive_cgroup_id, interactive_procs_id);
+        
+        let mut deamon_pid_map: Array<_, u32> = Array::try_from(ebpf.map_mut("DEAMON_PID").unwrap())?;
+        let own_pid = std::process::id();
+        deamon_pid_map.set(0, own_pid, 0)?;
+        info!("Registered deamon PID {} in DEAMON_PID map", own_pid);
     }
 
     let mut perf_array = aya::maps::perf::PerfEventArray::try_from(ebpf.map_mut("EVENTS").unwrap())?;

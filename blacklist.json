@@ -1,0 +1,26 @@
+{
+    "binaries": [
+      "sudo",
+      "su",
+      "pkexec",
+      "newgrp",
+      "gpasswd",
+      "nsenter",
+      "unshare",
+      "ncat",
+      "nc.openbsd",
+      "socat",
+      "curl",
+      "wget",
+      "ssh",
+      "scp",
+      "sftp",
+      "ftp",
+      "telnet"
+    ],
+    "paths": [
+      "/tmp",
+      "/dev/shm",
+      "/var/tmp"
+    ]
+}
