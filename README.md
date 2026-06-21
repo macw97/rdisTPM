@@ -95,14 +95,14 @@ sequenceDiagram
     participant B  as eBPF / Kernel
     participant T  as TPM2
 
-    rect rgb(225, 245, 238)
+    rect rgb(0, 90, 60)
         Note over L,B: Daemon startup
         L->>B: load & attach LSM programs
         L->>B: register cgroup IDs + binary blacklist
         B-->>L: ready — watching all exec events
     end
 
-    rect rgb(238, 237, 254)
+    rect rgb(60, 40, 130)
         Note over C,S: Phase 1 — SSH public key (1st factor)
         C->>S: connect + public key
         S->>C: challenge
@@ -113,7 +113,7 @@ sequenceDiagram
     SH->>SH: SSH_ORIGINAL_COMMAND set?
 
     alt non-interactive (scp · git · VS Code Remote)
-        rect rgb(230, 241, 251)
+        rect rgb(20, 70, 130)
             Note over SH,L: Phase 2a — classify session, no TPM challenge
             SH->>TA: tpm_auth --non-interactive
             TA->>L: ContextSend(NOT_TPM_AUTHENTICATED)
@@ -123,7 +123,7 @@ sequenceDiagram
         end
 
     else interactive shell
-        rect rgb(230, 241, 251)
+        rect rgb(20, 70, 130)
             Note over SH,T: Phase 2b — TPM challenge (2nd factor)
             SH->>TA: tpm_auth --interactive
             TA->>C: Enter TPM username & password
@@ -142,7 +142,7 @@ sequenceDiagram
         end
     end
 
-    rect rgb(250, 236, 231)
+    rect rgb(130, 50, 20)
         Note over B,T: Phase 3 — Re-auth: non-interactive session opens a shell with PTY
         Note right of B: e.g. VS Code integrated terminal
         B->>B: shell exec detected in ssh_non_interactive + PTY present
