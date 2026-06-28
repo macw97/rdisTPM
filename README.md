@@ -32,6 +32,26 @@ CC=${ARCH}-linux-musl-gcc cargo build --package lsm_tpm --release \
 The cross-compiled program `target/${ARCH}-unknown-linux-musl/release/lsm_tpm` can be
 copied to a Linux server or VM and run there.
 
+## Manual setup
+
+If you will connect with vscode remote explorer to machine running ebpf program.
+1. Generate ssh key on client
+2. Copy public key to the target machine
+3. Add in /etc/ssh/sshd_config line
+```shell
+PermitUserEnvironment SSH_CLIENT_TYPE
+```
+4. Add in ~/.ssh/authorized_keys line
+```shell
+environment="SSH_CLIENT_TYPE=vscode" <public key>
+```
+5. On client side add vscode private key to config
+```shell
+Host <machine with ebpf running>
+  ....
+  IdentityFile <path_to_private_key>/<vscode_key_name>
+  IdentitiesOnly yes
+```
 ## Architecture Diagram
 
 ```mermaid
