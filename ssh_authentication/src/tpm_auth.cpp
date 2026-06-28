@@ -36,32 +36,34 @@ enum return_code {
 int read_password_credentials(char *buffer_pass, size_t pass_size, char *buffer_user, size_t user_size) {
     struct termios _old, _new;
 
-    if(tcgetattr(STDIN_FILENO, &_old) != 0) {
-        return return_code::E_TERMIOS_ERROR;
-    }
-
-    _new = _old;
-    _new.c_lflag &= ~ECHO;
-
-    if(tcsetattr(STDIN_FILENO, TCSANOW, &_new) != 0) {
-        return return_code::E_TERMIOS_ERROR;
+    bool has_tty = (tcgetattr(STDIN_FILENO, &_old) == 0);
+    if(has_tty) {
+        _new = _old;
+        _new.c_lflag &= ~ECHO;
+        if(tcsetattr(STDIN_FILENO, TCSANOW, &_new) != 0) {
+            return return_code::E_TERMIOS_ERROR;
+        }
     }
 
     printf("Enter TPM username: ");
     fflush(stdout);
     if(fgets(buffer_user, user_size, stdin) == NULL) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &_old);
+        if(has_tty) {
+            tcsetattr(STDIN_FILENO, TCSANOW, &_old);
+        }
         return return_code::E_TERMIOS_ERROR;
     }
 
     printf("\nEnter TPM password: ");
     fflush(stdout);
     if(fgets(buffer_pass, pass_size, stdin) == NULL) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &_old);
+        if(has_tty) {
+            tcsetattr(STDIN_FILENO, TCSANOW, &_old);
+        }
         return return_code::E_TERMIOS_ERROR;
     }
 
-    tcsetattr(STDIN_FILENO, TCSANOW, &_old);
+    if(has_tty) { tcsetattr(STDIN_FILENO, TCSANOW, &_old); }
     buffer_user[strcspn(buffer_user, "\n")] = 0; // Remove newline character
     buffer_pass[strcspn(buffer_pass, "\n")] = 0; // Remove newline character
     return return_code::E_OK;
@@ -91,6 +93,15 @@ TSS2_RC load_sealed_object_from_tpm(ESYS_CONTEXT *ctx, ESYS_TR *sealed_handle) {
     return TSS2_RC_SUCCESS;
 }
 
+inline bool is_shell_call(const char* cmd) {
+    static const char* shells[] = {
+        "/bin/bash", "/bin/sh", "/usr/bin/bash",
+        "/usr/bin/sh", "bash" "sh"
+    };
+
+    return false;
+}
+
 int main(int argc, char *argv[])
 {
     ESYS_TR primary_handle = ESYS_TR_NONE;
@@ -105,34 +116,47 @@ int main(int argc, char *argv[])
     ESYS_TR sealed = ESYS_TR_NONE;
     TPM2B_SENSITIVE_DATA *out = NULL;
     int PID = getpid();
+    bool is_shell = false;
     SSHClient ssh_client(grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials()));
 
-    if(argc >= 2) {
-        if(strcmp(argv[1], "--non-interactive") == 0) {
+    std::vector<std::string> flags(argv+1, argv+argc);
+
+    const char* ssh_cmd = getenv("SSH_ORIGINAL_COMMAND");
+    if(ssh_cmd) {
+        is_shell = is_shell_call(ssh_cmd) ? true: false;
+    }
+
+    if(flags.size()>=2) {
+        if(flags[0] == "--non-interactive") {
             syslog(LOG_INFO, "SSH auth: Running in non-interactive mode, skipping password prompt");
-            ssh_client.SendContext(PID, false, sshinfo::NOT_TPM_AUTHENTICATED);
-            return return_code::E_OK;
-        } else if (strcmp(argv[1], "--reauthenticate") == 0) {
+        } else if (flags[0] == "--reauthenticate") {
             reauth = true;
-            if(argc >= 3) {
-                PID = atoi(argv[2]);
-                if (PID <= 0) {
-                    syslog(LOG_ERR, "SSH auth: Invalid PID argument: %s", argv[2]);
-                    return return_code::E_GENERAL_ERROR;
-                }
-            }
-        } else if (strcmp(argv[1], "--interactive") == 0) {
-            if(argc >= 3) {
-                PID = atoi(argv[2]);
-                if(PID <= 0) {
-                    syslog(LOG_ERR, "SSH auth: Invalid PID argument: %s", argv[2]);
-                    return return_code::E_GENERAL_ERROR;
-                }
-            }
+        } else if (flags[0] == "--interactive") {
+            syslog(LOG_INFO, "SSH auth: Running in interactive mode, 2FA authentication required");
         } else {
             syslog(LOG_ERR, "SSH auth: Invalid argument: %s", argv[1]);
             return return_code::E_GENERAL_ERROR;
         }
+
+        char* p;
+        long int pid = strtol(flags[1].c_str(), &p, 10);
+        if(*p) {
+            syslog(LOG_ERR, "SSH auth: Invalid PID argument: %s", argv[2]);
+            return return_code::E_GENERAL_ERROR;
+        } else {
+            PID = pid;
+        }
+
+        if(flags.size() == 3 && flags[2] == "--vs" && !is_shell) {
+            ssh_client.SendContext(PID, false, sshinfo::VSCODE_SESSION);
+            return return_code::E_OK;
+        } 
+
+        if(flags[0] == "--non-interactive" && !is_shell) {
+            ssh_client.SendContext(PID, false, sshinfo::NOT_TPM_AUTHENTICATED);
+            return return_code::E_OK;
+        }
+
     }
 
     rc = Tss2_TctiLdr_Initialize("device:/dev/tpmrm0", &tcti_ctx);
@@ -192,7 +216,7 @@ int main(int argc, char *argv[])
     secure_wipeout(username, sizeof(username));
     secure_wipeout(password, sizeof(password));
     
-    ssh_client.SendContext(PID, true, reauth ? sshinfo::OWNER_REAUTHENTICATED : sshinfo::OWNER_AUTHENTICATED);
+    ssh_client.SendContext(PID, is_shell ? false: true, reauth ? sshinfo::OWNER_REAUTHENTICATED : sshinfo::OWNER_AUTHENTICATED);
 
     return return_code::E_OK; // Return 0 for successful authentication, 1 for failure
 }

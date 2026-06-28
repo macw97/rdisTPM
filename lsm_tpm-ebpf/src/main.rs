@@ -38,6 +38,9 @@ static CGROUP_MAP: HashMap<u64, u32> = HashMap::with_max_entries(4,0);
 #[map(name = "DEAMON_PID")]
 static DEAMON_PID: Array<u32> = Array::with_max_entries(1,0);
 
+#[map(name = "ALLOWED_PID")]
+static ALLOWED_PID: Array<u32> = Array::with_max_entries(1,0);
+
 #[map(name="BLACKLIST_MAP")]
 static BLACKLIST_MAP: HashMap<[u8; 64], u8> = HashMap::with_max_entries(256,0);
 
@@ -107,6 +110,13 @@ unsafe fn try_bprm_check_security(ctx: LsmContext) -> Result<i32, i32> {
 
         // BLACKLISTs path and binary checks
         if cgroup_type == CGROUP_NON_INTERACTIVE {
+
+            if let Some(allowed_pid) = ALLOWED_PID.get(0) {
+                if *allowed_pid != 0 && *allowed_pid == pid {
+                    ALLOWED_PID.set(0, 0, 0).ok();
+                    return Ok(0);
+                }
+            }
             
             // for i in 0..32 {
             //     if let Some(path) = BLACKLIST_PATHS.get(i) {

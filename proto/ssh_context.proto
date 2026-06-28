@@ -6,6 +6,7 @@ enum AuthenticationType {
         NOT_TPM_AUTHENTICATED = 1;
         OWNER_AUTHENTICATED = 2;
         OWNER_REAUTHENTICATED = 3;
+        VSCODE_SESSION = 4;
 }
 
 message SSHContext {

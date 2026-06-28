@@ -11,6 +11,10 @@ PRIMARY_HANDLE="0x81000001"
 SEALED_HANDLE="0x81000002"
 # ------------------
 
+if [[ $EUID -ne 0]]; then
+    echo "This script have to be run as root"
+    exit 1
+
 echo "======= [1] Primary context check ======="
 
 if [ ! -f $PRIMARY_CTX ]; then

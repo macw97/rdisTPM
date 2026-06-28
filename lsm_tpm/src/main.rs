@@ -9,13 +9,13 @@ use std::fs;
 use std::io;
 use std::os::fd::{FromRawFd, IntoRawFd, AsRawFd};
 use std::os::unix::fs::MetadataExt;
-use std::sync::Arc;
 use tokio::signal;
 use tonic::{transport::Server, Request, Response, Status};
 use sshinfo::ssh_server::{Ssh, SshServer};
 use sshinfo::{SshContext, SshResponse, ErrorCode};
 use serde::Deserialize;
 use serde_json;
+use std::sync::{Arc, Mutex};
 
 // Configuration constants
 const PERF_HEADER_SIZE: usize = 8;
@@ -38,9 +38,9 @@ struct Blacklist {
     paths: Vec<String>,
 }
 
-
-#[derive(Debug, Default)]
-pub struct SshContextService {}
+pub struct SshContextService {
+    allowed_pids: Arc<Mutex<Array<MapData, u32>>>,
+}
 
 #[tonic::async_trait]
 impl Ssh for SshContextService {
@@ -55,6 +55,21 @@ impl Ssh for SshContextService {
                 return Err(Status::internal(format!("Cgroup migration failed: {}", e)));
             }
             info!("Migrated pid={} to interactive cgroup", ctx.pid);
+        }
+
+        if ctx.auth == sshinfo::AuthenticationType::VscodeSession as i32 {
+            match self.allowed_pids.lock() {
+                Ok(mut pid_array) => {
+                    if let Err(e) = pid_array.set(0, ctx.pid as u32, 0) {
+                        error!("Failed to insert vscode pid {} into allowed pids", ctx.pid);
+                    }
+                    info!("Vscode session whitelisted pid {}", ctx.pid); 
+                }
+                Err(e) => {
+                    error!("Internal error mutex poisoned: {}", e);
+                    return Err(Status::internal("Internal error"));
+                }
+            }
         }
 
         Ok(Response::new(SshResponse {
@@ -432,6 +447,9 @@ async fn main() -> anyhow::Result<()> {
         info!("Registered deamon PID {} in DEAMON_PID map", own_pid);
     }
 
+    let mut allowed_pid_array: Array<_,u32> = Array::try_from(ebpf.take_map("ALLOWED_PID").unwrap())?;
+    let allowed_pids = Arc::new(Mutex::new(allowed_pid_array));
+
     let mut perf_array = aya::maps::perf::PerfEventArray::try_from(ebpf.map_mut("EVENTS").unwrap())?;
     let mut perf_buffers = Vec::new();
     for cpu_id in online_cpus().map_err(|(_, error)| error)? {
@@ -445,7 +463,9 @@ async fn main() -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let mut grpc_handle = tokio::spawn(
         Server::builder()
-            .add_service(SshServer::new(SshContextService::default()))
+            .add_service(SshServer::new(SshContextService {
+                allowed_pids: Arc::clone(&allowed_pids)
+            }))
             .serve_with_shutdown(addr, async { 
                 let _ = shutdown_rx.await;
             }),

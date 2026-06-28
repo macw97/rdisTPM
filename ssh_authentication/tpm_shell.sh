@@ -15,8 +15,13 @@ fi
 # 1. Non-interactive mode (scp, git, vscode)
 if [ -n "$SSH_ORIGINAL_COMMAND" ]; then
     # Genuine non-interactive command — VS Code, git, scp etc.
-    echo "Non-interactive SSH command detected: $SSH_ORIGINAL_COMMAND"
-    /usr/local/bin/tpm_auth --non-interactive
+    if [ "$SSH_CLIENT_TYPE" = "vscode" ]; then
+        echo "Vscode connection setup"
+        /usr/local/bin/tpm_auth --non-interactive $$ --vs
+    else
+        echo "Non-interactive SSH command detected: $SSH_ORIGINAL_COMMAND"
+        /usr/local/bin/tpm_auth --non-interactive $$
+    fi 
     echo $$ | sudo tee "$SSH_NON_INTERACTIVE_GROUP/cgroup.procs" > /dev/null
     exec /bin/sh -c "$SSH_ORIGINAL_COMMAND"
 fi
