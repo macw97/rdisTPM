@@ -17,7 +17,8 @@ mod vmlinux;
 use aya_ebpf::{macros::lsm, programs::LsmContext};
 use aya_log_ebpf::info;
 use aya_ebpf::helpers::{self, bpf_get_current_pid_tgid, bpf_probe_read_kernel_str_bytes};
-use aya_ebpf::maps::{PerfEventArray, HashMap, Array};
+use aya_ebpf::maps::{PerfEventArray, HashMap, Array, LpmTrie};
+use aya_ebpf::maps::lpm_trie::Key;
 use core::str;
 use aya_ebpf::macros::map;
 use vmlinux::{file, linux_binprm};
@@ -45,7 +46,7 @@ static ALLOWED_PID: Array<u32> = Array::with_max_entries(1,0);
 static BLACKLIST_MAP: HashMap<[u8; 64], u8> = HashMap::with_max_entries(256,0);
 
 #[map(name="BLACKLIST_PATHS")]
-static BLACKLIST_PATHS: Array<[u8; 64]> = Array::with_max_entries(32,0);
+static BLACKLIST_PATHS: LpmTrie<[u8; 64], u8> = LpmTrie::with_max_entries(32,1);
 
 #[lsm(hook = "bprm_check_security")]
 pub fn bprm_check_security(ctx: LsmContext) -> i32 {
@@ -110,6 +111,9 @@ unsafe fn try_bprm_check_security(ctx: LsmContext) -> Result<i32, i32> {
 
         // BLACKLISTs path and binary checks
         if cgroup_type == CGROUP_NON_INTERACTIVE {
+            let file = bprm.file;
+            let mut absolute_path = [0u8; 64];
+
 
             if let Some(allowed_pid) = ALLOWED_PID.get(0) {
                 if *allowed_pid != 0 && *allowed_pid == pid {
@@ -117,19 +121,20 @@ unsafe fn try_bprm_check_security(ctx: LsmContext) -> Result<i32, i32> {
                     return Ok(0);
                 }
             }
-            
-            // for i in 0..32 {
-            //     if let Some(path) = BLACKLIST_PATHS.get(i) {
-            //         let trimmed = match path.iter().position(|&b| b == 0) {
-            //             Some(end) => &path[..end],
-            //             None => path.as_slice(),
-            //         };
-            //         if trimmed.is_empty() { continue; }
-            //         if str_bytes.starts_with(trimmed) { return Ok(-1); }
-            //     }
-            // }
 
-            let file = bprm.file;
+            let path_ptr = unsafe { &(*file).f_path as *const vmlinux::path as *mut aya_ebpf::bindings::path};
+            let ret = unsafe {
+                aya_ebpf::helpers::bpf_d_path(path_ptr,absolute_path.as_mut_ptr(), 64)
+            };
+            
+            if ret > 0 {
+                let lookup_path = Key::new(512, absolute_path);
+            
+                if BLACKLIST_PATHS.get(&lookup_path).is_some() {
+                    return Ok(-1);
+                }
+            }
+
             let dentry = unsafe{ (*file).f_path.dentry };
             let name_ptr = unsafe { (*dentry).d_name.name };
             let mut name_buf = [0u8; 64];

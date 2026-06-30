@@ -93,15 +93,6 @@ TSS2_RC load_sealed_object_from_tpm(ESYS_CONTEXT *ctx, ESYS_TR *sealed_handle) {
     return TSS2_RC_SUCCESS;
 }
 
-inline bool is_shell_call(const char* cmd) {
-    static const char* shells[] = {
-        "/bin/bash", "/bin/sh", "/usr/bin/bash",
-        "/usr/bin/sh", "bash" "sh"
-    };
-
-    return false;
-}
-
 int main(int argc, char *argv[])
 {
     ESYS_TR primary_handle = ESYS_TR_NONE;
@@ -116,15 +107,9 @@ int main(int argc, char *argv[])
     ESYS_TR sealed = ESYS_TR_NONE;
     TPM2B_SENSITIVE_DATA *out = NULL;
     int PID = getpid();
-    bool is_shell = false;
     SSHClient ssh_client(grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials()));
 
     std::vector<std::string> flags(argv+1, argv+argc);
-
-    const char* ssh_cmd = getenv("SSH_ORIGINAL_COMMAND");
-    if(ssh_cmd) {
-        is_shell = is_shell_call(ssh_cmd) ? true: false;
-    }
 
     if(flags.size()>=2) {
         if(flags[0] == "--non-interactive") {
@@ -147,12 +132,12 @@ int main(int argc, char *argv[])
             PID = pid;
         }
 
-        if(flags.size() == 3 && flags[2] == "--vs" && !is_shell) {
+        if(flags.size() == 3 && flags[2] == "--vs") {
             ssh_client.SendContext(PID, false, sshinfo::VSCODE_SESSION);
             return return_code::E_OK;
         } 
 
-        if(flags[0] == "--non-interactive" && !is_shell) {
+        if(flags[0] == "--non-interactive") {
             ssh_client.SendContext(PID, false, sshinfo::NOT_TPM_AUTHENTICATED);
             return return_code::E_OK;
         }
@@ -216,7 +201,7 @@ int main(int argc, char *argv[])
     secure_wipeout(username, sizeof(username));
     secure_wipeout(password, sizeof(password));
     
-    ssh_client.SendContext(PID, is_shell ? false: true, reauth ? sshinfo::OWNER_REAUTHENTICATED : sshinfo::OWNER_AUTHENTICATED);
+    ssh_client.SendContext(PID, true, reauth ? sshinfo::OWNER_REAUTHENTICATED : sshinfo::OWNER_AUTHENTICATED);
 
     return return_code::E_OK; // Return 0 for successful authentication, 1 for failure
 }

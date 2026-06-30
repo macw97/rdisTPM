@@ -1,5 +1,6 @@
 use aya::{Btf, programs::Lsm};
-use aya::maps::{perf, MapData, HashMap, Array};
+use aya::maps::{perf, MapData, HashMap, Array, LpmTrie};
+use aya::maps::lpm_trie::Key;
 use aya::util::online_cpus;
 use bytes::BytesMut;
 use lsm_tpm_common::SecurityEvent;
@@ -361,15 +362,15 @@ fn load_blacklist(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
         blacklist_map.insert(key, 1, 0)?;
     }
 
-    let mut paths: Array<_, [u8; 64]> = Array::try_from(ebpf.map_mut("BLACKLIST_PATHS").unwrap())?;
+    let mut paths: LpmTrie<_, [u8; 64], u8> = LpmTrie::try_from(ebpf.map_mut("BLACKLIST_PATHS").unwrap())?;
 
     for (idx,path) in blacklist.paths.iter().enumerate() {
         let mut key = [0u8; 64];
         let bytes = path.as_bytes();
         let len = bytes.len().min(64);
         key[..len].copy_from_slice(&bytes[..len]);
-
-        paths.set(idx as u32, key, 0)?;
+        let p = Key::new((len*8) as u32, key);
+        paths.insert(&p, 1u8, 0)?;
     }
 
     Ok(())
