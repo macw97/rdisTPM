@@ -35,3 +35,14 @@ target_link_libraries(ssh_authentication
     PRIVATE
         ssh_service
 )
+
+add_custom_target(install_tpm_shell ALL
+    COMMAND sudo install -m 755 ${CMAKE_CURRENT_SOURCE_DIR}/tpm_shell.sh
+    /usr/local/bin/tpm_shell
+    COMMENT "Installing tpm_shell.sh -> /usr/local/bin/tpm_shell")
+
+add_custom_command(TARGET ssh_authentication
+    POST_BUILD
+    COMMAND sudo install -m 4755 -o root -g root $<TARGET_FILE:ssh_authentication>
+    /usr/local/bin/tpm_auth
+    COMMENT "Installing ssh_authentication -> /usr/local/bin/tpm_auth")

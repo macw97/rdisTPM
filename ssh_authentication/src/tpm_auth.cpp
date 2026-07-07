@@ -107,7 +107,7 @@ int main(int argc, char *argv[])
     ESYS_TR sealed = ESYS_TR_NONE;
     TPM2B_SENSITIVE_DATA *out = NULL;
     int PID = getpid();
-    SSHClient ssh_client(grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials()));
+    SSHClient ssh_client(grpc::CreateChannel("unix:///var/run/lsm_tpm.sock", grpc::InsecureChannelCredentials()));
 
     std::vector<std::string> flags(argv+1, argv+argc);
 

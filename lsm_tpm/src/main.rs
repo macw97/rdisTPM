@@ -9,9 +9,11 @@ use libc::{epoll_create1, epoll_ctl, epoll_wait, EPOLL_CTL_ADD, epoll_event, EPO
 use std::fs;
 use std::io;
 use std::os::fd::{FromRawFd, IntoRawFd, AsRawFd};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use tokio::signal;
 use tonic::{transport::Server, Request, Response, Status};
+use tokio::net::UnixListener;
+use tokio_stream::wrappers::UnixListenerStream;
 use sshinfo::ssh_server::{Ssh, SshServer};
 use sshinfo::{SshContext, SshResponse, ErrorCode};
 use serde::Deserialize;
@@ -27,7 +29,7 @@ const TPM_AUTH_PATH: &str = "/usr/local/bin/tpm_auth";
 const INTERACTIVE_CGROUP_PATH: &str = "/sys/fs/cgroup/ssh_interactive/cgroup.procs";
 const BLACKLIST_PATH: &str = "blacklist.json";
 const SHELL_PATHS: &[&str] = &["/bin/bash", "/usr/bin/bash"];
-const GRPC_ADDR: &str = "[::1]:50051";
+const SOCKET_PATH: &str = "/var/run/lsm_tpm.sock";
 
 pub mod sshinfo {
     tonic::include_proto!("sshinfo");
@@ -428,7 +430,10 @@ async fn main() -> anyhow::Result<()> {
 
     load_blacklist(ebpf)?;
     
-    let addr = GRPC_ADDR.parse()?;
+    let _ = std::fs::remove_file(SOCKET_PATH);
+    let uds = UnixListener::bind(SOCKET_PATH)?;
+    std::fs::set_permissions(SOCKET_PATH, std::fs::Permissions::from_mode(0o600))?;
+    let uds_stream = UnixListenerStream::new(uds);
     
     {
         let mut cgroup_map: HashMap<_, u64, u32> = HashMap::try_from(ebpf.map_mut("CGROUP_MAP").unwrap())?;
@@ -467,7 +472,7 @@ async fn main() -> anyhow::Result<()> {
             .add_service(SshServer::new(SshContextService {
                 allowed_pids: Arc::clone(&allowed_pids)
             }))
-            .serve_with_shutdown(addr, async { 
+            .serve_with_incoming_shutdown(uds_stream, async { 
                 let _ = shutdown_rx.await;
             }),
     );
@@ -496,5 +501,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("Exiting...");
+    let _ = std::fs::remove_file(SOCKET_PATH);
     Ok(())
 }
