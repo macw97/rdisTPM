@@ -55,6 +55,20 @@ Host <machine with ebpf running>
 ## Architecture Diagram
 
 ```mermaid
+%%{init: {
+  "theme": "dark",
+  "themeVariables": {
+    "background": "#0d1117",
+    "primaryColor": "#1f2937",
+    "primaryBorderColor": "#60a5fa",
+    "primaryTextColor": "#e5e7eb",
+    "lineColor": "#9ca3af",
+    "secondaryColor": "#1f2937",
+    "tertiaryColor": "#111827",
+    "edgeLabelBackground": "#111827",
+    "fontFamily": "monospace"
+  }
+}}%%
 graph TB
     SSH["SSH Client"]
 
@@ -62,44 +76,52 @@ graph TB
         SSHD["sshd\nForceCommand → tpm_shell"]
 
         subgraph SSHAUTH["ssh_authentication/"]
-            SH["/usr/local/bin/tpm_shell\nroutes interactive vs non-interactive"]
-            TA["/usr/local/bin/tpm_auth\nprompts credentials · calls TPM · notifies daemon"]
+            SH["/usr/local/bin/tpm_shell\n(tpm_shell.sh, mode 755)\nroutes interactive vs non-interactive"]
+            TA["/usr/local/bin/tpm_auth\n built as CMake target 'ssh_authentication'\nfrom src/tpm_auth.cpp + src/ssh_context_client.cpp\nprompts credentials · calls TPM · notifies daemon"]
         end
 
-        subgraph LSMD["lsm_tpm daemon"]
-            CORE["Event Loop\nreads shell-exec events from kernel\ntriggers re-auth when needed"]
-            GSRV["gRPC Server\nSSH.ContextSend\nassigns PID to correct cgroup"]
+        subgraph LSMD["lsm_tpm daemon (single process)"]
+            CORE["Event Loop\nreads ALL exec events from perf buffer\nfilters: bash/usr-bin-bash + non-interactive cgroup + PTY\n→ triggers re-auth (SIGSTOP / SIGCONT)"]
+            GSRV["gRPC Server (SSH.ContextSend)\nover Unix socket /var/run/lsm_tpm.sock\nwrites PID to ssh_interactive/cgroup.procs\nwhitelists PID in ALLOWED_PID map (VS Code)"]
         end
 
-        subgraph KSPACE["Kernel Space"]
-            EBPF["eBPF LSM Programs\nbprm_check_security — watches shell execs\nfile_permission — guards cgroup writes\nblacklist enforcement"]
+        subgraph KSPACE["Kernel Space (eBPF LSM)"]
+            EBPF["bprm_check_security — emits exec events for ALL execs;\nwithin ssh_non_interactive cgroup: denies blacklisted\nbinaries/paths unless PID is in ALLOWED_PID\nfile_permission — only the daemon's own PID may write\nto ssh_interactive/cgroup.procs"]
             CG["cgroups v2\nssh_interactive\nssh_non_interactive"]
         end
     end
 
-    TPM2["TPM2 Chip\nsealed secret at handle 0x81000002\nunlocked by user passphrase"]
+    TPM2["TPM2 Chip (/dev/tpmrm0)\nsealed secret @ persistent handle 0x81000002\nauth value = password typed by user"]
 
     SSH  -->|"TCP · public key"| SSHD
     SSHD -->|"ForceCommand"| SH
-    SH   -->|"exec"| TA
-    TA   -->|"ContextSend\n(auth result + PID)"| GSRV
-    TA   -.->|"Esys_Unseal"| TPM2
+    SH   -->|"invoke (subprocess, waits for exit code)"| TA
+    TA   -->|"ContextSend\n(auth result + PID, or VSCODE_SESSION)"| GSRV
+    TA   -.->|"Esys_TR_SetAuth + Esys_Unseal"| TPM2
     TPM2 -.->|"secret or error"| TA
-    GSRV -->|"assign PID"| CG
-    SH   -->|"assign PID\n(non-interactive)"| CG
-    CORE -->|"re-auth:\nfreeze · challenge · resume"| TA
-    EBPF -->|"shell exec events"| CORE
-    EBPF -->|"enforce\ncgroup write access"| CG
-    LSMD <-->|"load · attach · BPF maps"| EBPF
+    GSRV -->|"write PID\n(ssh_interactive/cgroup.procs)"| CG
+    GSRV -->|"one-shot exec bypass\n(ALLOWED_PID map)"| EBPF
+    SH   -->|"write PID\n(ssh_non_interactive/cgroup.procs)"| CG
+    CORE -->|"re-auth:\nSIGSTOP · tpm_auth --reauthenticate on TTY · SIGCONT"| TA
+    EBPF -->|"exec events (perf buffer)"| CORE
+    EBPF -->|"guard cgroup.procs writes"| CG
+    LSMD <-->|"load · attach · perf buffer · maps\n(CGROUP_MAP, DEAMON_PID, ALLOWED_PID, BLACKLIST_MAP/PATHS)"| EBPF
 
-    classDef kernel fill:#EEEDFE,stroke:#534AB7,color:#3C3489
-    classDef daemon fill:#E6F1FB,stroke:#185FA5,color:#0C447C
-    classDef app    fill:#E1F5EE,stroke:#0F6E56,color:#085041
-    classDef ext    fill:#FAECE7,stroke:#993C1D,color:#712B13
+    style HOST    fill:#0d1117,stroke:#374151,color:#e5e7eb
+    style SSHAUTH fill:#111827,stroke:#374151,color:#e5e7eb
+    style LSMD    fill:#0b1220,stroke:#374151,color:#e5e7eb
+    style KSPACE  fill:#170f24,stroke:#374151,color:#e5e7eb
+
+    classDef kernel fill:#2b2140,stroke:#a78bfa,color:#ede9fe,stroke-width:2px
+    classDef daemon fill:#122a3d,stroke:#38bdf8,color:#e0f2fe,stroke-width:2px
+    classDef app    fill:#0f2e24,stroke:#34d399,color:#d1fae5,stroke-width:2px
+    classDef ext    fill:#3a2313,stroke:#fb923c,color:#ffedd5,stroke-width:2px
     class EBPF,CG kernel
     class CORE,GSRV daemon
     class SSHD,SH,TA app
     class SSH,TPM2 ext
+
+    linkStyle default stroke:#9ca3af,stroke-width:1.5px,color:#e5e7eb
 ```
 
 ## Sequence Diagram
